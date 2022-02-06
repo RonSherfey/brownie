@@ -3,6 +3,7 @@
 import importlib
 import json
 import os
+import re
 import shutil
 import sys
 import warnings
@@ -29,9 +30,12 @@ from brownie._config import (
     _load_project_compiler_config,
     _load_project_config,
     _load_project_dependencies,
+    _load_project_envvars,
     _load_project_structure_config,
 )
+from brownie._expansion import expand_posix_vars
 from brownie.exceptions import (
+    BadProjectName,
     BrownieEnvironmentWarning,
     InvalidPackage,
     PragmaError,
@@ -56,6 +60,7 @@ BUILD_FOLDERS = ["contracts", "deployments", "interfaces"]
 MIXES_URL = "https://github.com/brownie-mix/{}-mix/archive/{}.zip"
 
 GITIGNORE = """__pycache__
+.env
 .history
 .hypothesis/
 build/
@@ -87,13 +92,18 @@ class _ProjectBase:
             os.chdir(self._path)
 
         try:
+            project_evm_version = compiler_config["evm_version"]
+            evm_version = {
+                "Solidity": compiler_config["solc"].get("evm_version", project_evm_version),
+                "Vyper": compiler_config["vyper"].get("evm_version", project_evm_version),
+            }
             build_json = compiler.compile_and_format(
                 contract_sources,
                 solc_version=compiler_config["solc"].get("version", None),
                 vyper_version=compiler_config["vyper"].get("version", None),
                 optimize=compiler_config["solc"].get("optimize", None),
                 runs=compiler_config["solc"].get("runs", None),
-                evm_version=compiler_config["evm_version"],
+                evm_version=evm_version,
                 silent=silent,
                 allow_paths=allow_paths,
                 remappings=compiler_config["solc"].get("remappings", []),
@@ -167,18 +177,23 @@ class Project(_ProjectBase):
 
     def __init__(self, name: str, project_path: Path) -> None:
         self._path: Path = project_path
-        self._structure = _load_project_structure_config(project_path)
+        self._envvars = _load_project_envvars(project_path)
+        self._structure = expand_posix_vars(
+            _load_project_structure_config(project_path), self._envvars
+        )
         self._build_path: Path = project_path.joinpath(self._structure["build"])
 
         self._name = name
         self._active = False
         self.load()
 
-    def load(self) -> None:
+    def load(self, raise_if_loaded: bool = True) -> None:
         """Compiles the project contracts, creates ContractContainer objects and
         populates the namespace."""
         if self._active:
-            raise ProjectAlreadyLoaded("Project is already active")
+            if raise_if_loaded:
+                raise ProjectAlreadyLoaded("Project is already active")
+            return None
 
         contract_sources = _load_sources(self._path, self._structure["contracts"], False)
         interface_sources = _load_sources(self._path, self._structure["interfaces"], True)
@@ -221,7 +236,9 @@ class Project(_ProjectBase):
             self._build._add_interface(build_json)
             interface_hashes[path.stem] = build_json["sha1"]
 
-        self._compiler_config = _load_project_compiler_config(self._path)
+        self._compiler_config = expand_posix_vars(
+            _load_project_compiler_config(self._path), self._envvars
+        )
 
         # compile updated sources, update build
         changed = self._get_changed_contracts(interface_hashes)
@@ -281,16 +298,18 @@ class Project(_ProjectBase):
         if build_json["sha1"] != sha1(source.encode()).hexdigest():
             return True
         # compare compiler settings
-        if _compare_settings(config, build_json["compiler"]):
-            return True
         if build_json["language"] == "Solidity":
             # compare solc-specific compiler settings
             solc_config = config["solc"].copy()
             solc_config["remappings"] = None
-            if _compare_settings(solc_config, build_json["compiler"]):
+            if not _solidity_compiler_equal(solc_config, build_json["compiler"]):
                 return True
             # compare solc pragma against compiled version
             if Version(build_json["compiler"]["version"]) not in get_pragma_spec(source):
+                return True
+        else:
+            vyper_config = config["vyper"].copy()
+            if not _vyper_compiler_equal(vyper_config, build_json["compiler"]):
                 return True
         return False
 
@@ -308,6 +327,7 @@ class Project(_ProjectBase):
         changed_sources = {i: self._sources.get(i) for i in changed_paths}
         abi_json = compiler.get_abi(
             changed_sources,
+            solc_version=self._compiler_config["solc"].get("version", None),
             allow_paths=self._path.as_posix(),
             remappings=self._compiler_config["solc"].get("remappings", []),
         )
@@ -537,11 +557,14 @@ def check_for_project(path: Union[Path, str] = ".") -> Optional[Path]:
         structure_config = _load_project_structure_config(folder)
         contracts = folder.joinpath(structure_config["contracts"])
         interfaces = folder.joinpath(structure_config["interfaces"])
+        scripts = folder.joinpath(structure_config["scripts"])
         tests = folder.joinpath(structure_config["tests"])
 
         if next((i for i in contracts.glob("**/*") if i.suffix in (".vy", ".sol")), None):
             return folder
         if next((i for i in interfaces.glob("**/*") if i.suffix in (".json", ".vy", ".sol")), None):
+            return folder
+        if next((i for i in scripts.glob("**/*") if i.suffix in (".py")), None):
             return folder
         if contracts.is_dir() and tests.is_dir():
             return folder
@@ -589,7 +612,9 @@ def from_brownie_mix(
     Returns the path to the project as a string.
     """
     project_name = str(project_name).lower().replace("-mix", "")
-    default_branch = _get_mix_default_branch(project_name)
+    headers = REQUEST_HEADERS.copy()
+    headers.update(_maybe_retrieve_github_auth())
+    default_branch = _get_mix_default_branch(project_name, headers)
     url = MIXES_URL.format(project_name, default_branch)
     if project_path is None:
         project_path = Path(".").joinpath(project_name)
@@ -598,7 +623,7 @@ def from_brownie_mix(
         raise FileExistsError(f"Folder already exists - {project_path}")
 
     print(f"Downloading from {url}...")
-    _stream_download(url, str(project_path.parent))
+    _stream_download(url, str(project_path.parent), headers)
     project_path.parent.joinpath(f"{project_name}-mix-{default_branch}").rename(project_path)
     _create_folders(project_path)
     _create_gitfiles(project_path)
@@ -684,7 +709,11 @@ def compile_source(
         raise exc
 
 
-def load(project_path: Union[Path, str, None] = None, name: Optional[str] = None) -> "Project":
+def load(
+    project_path: Union[Path, str, None] = None,
+    name: Optional[str] = None,
+    raise_if_loaded: bool = True,
+) -> "Project":
     """Loads a project and instantiates various related objects.
 
     Args:
@@ -704,9 +733,15 @@ def load(project_path: Union[Path, str, None] = None, name: Optional[str] = None
                 "which is different from the current working directory",
                 BrownieEnvironmentWarning,
             )
+    else:
+        project_path = Path(project_path)
+        if project_path.resolve() != check_for_project(project_path):
+            packages_path = _get_data_folder().joinpath("packages")
+            if not project_path.is_absolute() and packages_path.joinpath(project_path).exists():
+                project_path = packages_path.joinpath(project_path)
+            else:
+                project_path = None
 
-    elif Path(project_path).resolve() != check_for_project(project_path):
-        project_path = None
     if project_path is None:
         raise ProjectNotFound("Could not find Brownie project")
 
@@ -715,9 +750,15 @@ def load(project_path: Union[Path, str, None] = None, name: Optional[str] = None
         name = project_path.name
         if not name.lower().endswith("project"):
             name += " project"
-        name = "".join(i for i in name.title() if i.isalpha())
-    if next((True for i in _loaded_projects if i._name == name), False):
-        raise ProjectAlreadyLoaded("There is already a project loaded with this name")
+        if not name[0].isalpha():
+            raise BadProjectName("Project must start with an alphabetic character")
+        name = "".join(i for i in name.title() if i.isalnum())
+
+    for loaded_project in _loaded_projects:
+        if loaded_project._name == name:
+            if raise_if_loaded:
+                raise ProjectAlreadyLoaded("There is already a project loaded with this name")
+            return loaded_project
 
     # paths
     _create_folders(project_path)
@@ -779,6 +820,18 @@ def _install_from_ethpm(uri: str) -> str:
     return f"{org}/{repo}@{version}"
 
 
+def _maybe_retrieve_github_auth() -> Dict[str, str]:
+    """Returns appropriate github authorization headers.
+
+    Otherwise returns an empty dict if no auth token is present.
+    """
+    token = os.getenv("GITHUB_TOKEN")
+    if token:
+        auth = b64encode(token.encode()).decode()
+        return {"Authorization": f"Basic {auth}"}
+    return {}
+
+
 def _install_from_github(package_id: str) -> str:
     try:
         path, version = package_id.split("@")
@@ -797,39 +850,15 @@ def _install_from_github(package_id: str) -> str:
         raise FileExistsError("Package is aleady installed")
 
     headers = REQUEST_HEADERS.copy()
-    if os.getenv("GITHUB_TOKEN"):
-        auth = b64encode(os.environ["GITHUB_TOKEN"].encode()).decode()
-        headers.update({"Authorization": "Basic {}".format(auth)})
+    headers.update(_maybe_retrieve_github_auth())
 
-    response = requests.get(
-        f"https://api.github.com/repos/{org}/{repo}/tags?per_page=100", headers=headers
-    )
-    if response.status_code != 200:
-        msg = "Status {} when getting package versions from Github: '{}'".format(
-            response.status_code, response.json()["message"]
-        )
-        if response.status_code == 403:
-            msg += (
-                "\n\nIf this issue persists, generate a Github API token and store"
-                " it as the environment variable `GITHUB_TOKEN`:\n"
-                "https://github.blog/2013-05-16-personal-api-tokens/"
-            )
-        raise ConnectionError(msg)
-
-    data = response.json()
-    if not data:
-        raise ValueError("Github repository has no tags set")
-    org, repo = data[0]["zipball_url"].split("/")[3:5]
-    tags = [i["name"].lstrip("v") for i in data]
-    if version not in tags:
-        raise ValueError(
-            "Invalid version for this package. Available versions are:\n" + ", ".join(tags)
-        ) from None
-
-    download_url = next(i["zipball_url"] for i in data if i["name"].lstrip("v") == version)
+    if re.match(r"^[0-9a-f]+$", version):
+        download_url = f"https://api.github.com/repos/{org}/{repo}/zipball/{version}"
+    else:
+        download_url = _get_download_url_from_tag(org, repo, version, headers)
 
     existing = list(install_path.parent.iterdir())
-    _stream_download(download_url, str(install_path.parent))
+    _stream_download(download_url, str(install_path.parent), headers)
 
     installed = next(i for i in install_path.parent.iterdir() if i not in existing)
     shutil.move(installed, install_path)
@@ -874,6 +903,36 @@ def _install_from_github(package_id: str) -> str:
     return f"{org}/{repo}@{version}"
 
 
+def _get_download_url_from_tag(org: str, repo: str, version: str, headers: dict) -> str:
+    response = requests.get(
+        f"https://api.github.com/repos/{org}/{repo}/tags?per_page=100", headers=headers
+    )
+    if response.status_code != 200:
+        msg = "Status {} when getting package versions from Github: '{}'".format(
+            response.status_code, response.json()["message"]
+        )
+        if response.status_code in (403, 404):
+            msg += (
+                "\n\nMissing or forbidden.\n"
+                "If this issue persists, generate a Github API token and store"
+                " it as the environment variable `GITHUB_TOKEN`:\n"
+                "https://github.blog/2013-05-16-personal-api-tokens/"
+            )
+        raise ConnectionError(msg)
+
+    data = response.json()
+    if not data:
+        raise ValueError("Github repository has no tags set")
+    org, repo = data[0]["zipball_url"].split("/")[3:5]
+    tags = [i["name"].lstrip("v") for i in data]
+    if version not in tags:
+        raise ValueError(
+            "Invalid version for this package. Available versions are:\n" + ", ".join(tags)
+        ) from None
+
+    return next(i["zipball_url"] for i in data if i["name"].lstrip("v") == version)
+
+
 def _create_gitfiles(project_path: Path) -> None:
     gitignore = project_path.joinpath(".gitignore")
     if not gitignore.exists():
@@ -908,6 +967,22 @@ def _compare_settings(left: Dict, right: Dict) -> bool:
     )
 
 
+def _normalize_solidity_version(version: str) -> str:
+    return version.split("+")[0]
+
+
+def _solidity_compiler_equal(config: dict, build: dict) -> bool:
+    return (
+        config["version"] is None
+        or _normalize_solidity_version(config["version"])
+        == _normalize_solidity_version(build["version"])
+    ) and config["optimizer"] == build["optimizer"]
+
+
+def _vyper_compiler_equal(config: dict, build: dict) -> bool:
+    return config["version"] is None or config["version"] == build["version"]
+
+
 def _load_sources(project_path: Path, subfolder: str, allow_json: bool) -> Dict:
     contract_sources: Dict = {}
     suffixes: Tuple = (".sol", ".vy")
@@ -935,8 +1010,10 @@ def _load_sources(project_path: Path, subfolder: str, allow_json: bool) -> Dict:
     return contract_sources
 
 
-def _stream_download(download_url: str, target_path: str) -> None:
-    response = requests.get(download_url, stream=True, headers=REQUEST_HEADERS)
+def _stream_download(
+    download_url: str, target_path: str, headers: Dict[str, str] = REQUEST_HEADERS
+) -> None:
+    response = requests.get(download_url, stream=True, headers=headers)
 
     if response.status_code == 404:
         raise ConnectionError(
@@ -962,7 +1039,7 @@ def _stream_download(download_url: str, target_path: str) -> None:
         zf.extractall(target_path)
 
 
-def _get_mix_default_branch(mix_name: str) -> str:
+def _get_mix_default_branch(mix_name: str, headers: Dict[str, str] = REQUEST_HEADERS) -> str:
     """Get the default branch for a brownie-mix repository.
 
     Arguments
@@ -976,14 +1053,15 @@ def _get_mix_default_branch(mix_name: str) -> str:
         The default branch name on github.
     """
     REPO_GH_API = f"https://api.github.com/repos/brownie-mix/{mix_name}-mix"
-    r = requests.get(REPO_GH_API, headers=REQUEST_HEADERS)
+    r = requests.get(REPO_GH_API, headers=headers)
     if r.status_code != 200:
         status, repo, message = r.status_code, f"brownie-mix/{mix_name}", r.json()["message"]
         msg = f"Status {status} when retrieving repo {repo} information from GHAPI: '{message}'"
-        if r.status_code == 403:
+        if r.status_code in (403, 404):
             msg_lines = (
                 msg,
-                "\n\nIf this issue persists, generate a Github API token and store",
+                "\n\nMissing or forbidden.\n",
+                "If this issue persists, generate a Github API token and store",
                 " it as the environment variable `GITHUB_TOKEN`:\n",
                 "https://github.blog/2013-05-16-personal-api-tokens/",
             )

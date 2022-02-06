@@ -4,7 +4,7 @@
 Deployment Basics
 =================
 
-Once your project is ready to be deployed to a persistent chain (such as the Etherem mainnet or a testnet), Brownie can be used to handle the deployments.
+Once your project is ready to be deployed to a persistent chain (such as the Ethereum mainnet or a testnet), Brownie can be used to handle the deployments.
 
 It is important to remember that blockchains are `permanent` and `immutable`. Once your project has been deployed there is no going back. For this reason, we highly recommend the following process when deploying to the mainnet:
 
@@ -89,7 +89,7 @@ The following actions WILL remove locally stored deployment data within your pro
 
 To restore a deleted :func:`ProjectContract <brownie.network.contract.ProjectContract>` instance, or generate one for a deployment that was handled outside of Brownie, use the :func:`ContractContainer.at <ContractContainer.at>` method.
 
-Verifying Deployments on Etherscan
+Verifying Deployment Source Code
 ==========================================
 
 Brownie features automatic source code verification for solidity contracts on all networks supported by etherscan. To verify a contract while deploying it, add the ``publish_source=True`` argument:

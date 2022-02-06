@@ -4,7 +4,7 @@
 Quickstart
 ==========
 
-This page provides a quick overview of how to use Brownie. It relies mostly on examples and assumes a level of familiarity with Python and smart contract dvelopment. For more in-depth content, you should read the documentation sections under "Getting Started" in the table of contents.
+This page provides a quick overview of how to use Brownie. It relies mostly on examples and assumes a level of familiarity with Python and smart contract development. For more in-depth content, you should read the documentation sections under "Getting Started" in the table of contents.
 
 If you have any questions about how to use Brownie, feel free to ask on `Ethereum StackExchange <https://ethereum.stackexchange.com/>`_ or join us on `Gitter <https://gitter.im/eth-brownie/community>`_.
 
@@ -133,7 +133,7 @@ Brownie provides a :func:`ContractContainer <brownie.network.contract.ContractCo
     >>> Token.deploy
     <ContractConstructor object 'Token.constructor(string _symbol, string _name, uint256 _decimals, uint256 _totalSupply)'>
 
-    >>> t = Token.deploy("Test Token", "TST", 18, 1e20, {'from': accounts[1]})
+    >>> t = Token.deploy("Test Token", "TST", 18, 1e21, {'from': accounts[1]})
 
     Transaction sent: 0x2e3cab83342edda14141714ced002e1326ecd8cded4cd0cf14b2f037b690b976
     Transaction confirmed - block: 1   gas spent: 594186

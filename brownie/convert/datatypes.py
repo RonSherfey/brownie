@@ -4,6 +4,11 @@ from copy import deepcopy
 from decimal import Decimal, getcontext
 from typing import Any, Dict, ItemsView, KeysView, List, Optional, Sequence, TypeVar, Union
 
+try:
+    from vyper.exceptions import DecimalOverrideException
+except ImportError:
+    DecimalOverrideException = BaseException  # regular catch blocks shouldn't catch
+
 import eth_utils
 from hexbytes import HexBytes
 
@@ -35,7 +40,7 @@ class Wei(int):
         * a large float in scientific notation, where direct conversion to int
           would cause inaccuracy: 8.3e32
         * bytes: b'\xff\xff'
-        * hex strings: "0x330124\""""
+        * hex strings: "0x330124\" """
 
     # Known typing error: https://github.com/python/mypy/issues/4290
     def __new__(cls, value: Any) -> Any:  # type: ignore
@@ -91,10 +96,10 @@ class Wei(int):
 
 def _to_wei(value: WeiInputTypes) -> int:
     original = value
-    if value is None:
-        return 0
     if isinstance(value, bytes):
         value = HexBytes(value).hex()
+    if value is None or value == "0x":
+        return 0
     if isinstance(value, float) and "e+" in str(value):
         num_str, dec = str(value).split("e+")
         num = num_str.split(".") if "." in num_str else [num_str, ""]
@@ -182,11 +187,15 @@ def _to_fixed(value: Any) -> Decimal:
         except TypeError:
             pass
     try:
-        ctx = getcontext()
-        ctx.prec = 100
-        return Decimal(value, context=ctx)
-    except Exception:
-        raise TypeError(f"Cannot convert {type(value).__name__} '{value}' to decimal.")
+        try:
+            # until vyper v0.3.1 we can mess with the precision
+            ctx = getcontext()
+            ctx.prec = 78
+        except DecimalOverrideException:
+            pass  # vyper set the precision, do nothing.
+        return Decimal(value)
+    except Exception as e:
+        raise TypeError(f"Cannot convert {type(value).__name__} '{value}' to decimal.") from e
 
 
 class EthAddress(str):

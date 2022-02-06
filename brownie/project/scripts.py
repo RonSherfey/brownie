@@ -6,8 +6,8 @@ import sys
 import warnings
 from hashlib import sha1
 from pathlib import Path
-from types import ModuleType
-from typing import Any, Dict, Optional, Tuple
+from types import FunctionType, ModuleType
+from typing import Any, Dict, List, Optional, Tuple
 
 from brownie.exceptions import ProjectNotFound
 from brownie.project.main import Project, check_for_project, get_loaded_projects
@@ -22,7 +22,8 @@ def run(
     args: Optional[Tuple] = None,
     kwargs: Optional[Dict] = None,
     project: Any = None,
-) -> None:
+    _include_frame: bool = False,
+) -> Any:
     """Loads a project script and runs a method in it.
 
     script_path: path of script to load
@@ -50,10 +51,10 @@ def run(
 
     try:
         module = _import_from_path(script)
-
         name = module.__name__
 
-        if not hasattr(module, method_name):
+        func = getattr(module, method_name, None)
+        if not isinstance(func, FunctionType):
             raise AttributeError(f"Module '{name}' has no method '{method_name}'")
         try:
             module_path = Path(module.__file__).relative_to(Path(".").absolute())
@@ -63,7 +64,45 @@ def run(
             f"\nRunning '{color('bright blue')}{module_path}{color}::"
             f"{color('bright cyan')}{method_name}{color}'..."
         )
-        return getattr(module, method_name)(*args, **kwargs)
+
+        if not _include_frame:
+            return func(*args, **kwargs)
+
+        # this voodoo preserves the call frame of the function after it has finished executing.
+        # we do this so that `brownie run -i` is able to drop into the console with the same
+        # namespace as the function that it just ran.
+
+        # first, we extract the source code from the function and parse it to an AST
+        # we generate the AST from the entire module to preserve line numbers
+        with Path(module.__file__).open() as fp:
+            source = fp.read()
+        func_ast = ast.parse(source)
+
+        # use the last function with the correct name, consistent with how python handles
+        func_nodes: List = [
+            i for i in func_ast.body if isinstance(i, ast.FunctionDef) and i.name == method_name
+        ]
+        func_ast.body = func_nodes[-1:]
+
+        # next, we insert some new logic into the beginning of the function. this imports
+        # the sys module and assigns the current frame to a global var `__brownie_frame`
+        injected_source = "import sys\nglobal __brownie_frame\n__brownie_frame = sys._getframe()"
+        injected_ast = ast.parse(injected_source)
+        func_ast.body[0].body = injected_ast.body + func_ast.body[0].body  # type: ignore
+
+        # now we compile the AST into a code object, using the module's `__dict__` as our globals
+        # so that we have access to all the required imports and other objects
+        f_locals: Dict = module.__dict__.copy()
+        del f_locals[method_name]
+        func_code = compile(func_ast, module.__file__, "exec")
+        exec(func_code, f_locals)
+
+        # finally, we execute our new function from inside the copied globals dict. the frame
+        # is added to the dict as `__global_frame` per our injected code, and we return it for
+        # use within the console. so simple!
+        return_value = f_locals[method_name](*args, **kwargs)
+        return return_value, f_locals["__brownie_frame"]
+
     finally:
         # cleanup namespace and sys.path
         sys.path.remove(root_path)

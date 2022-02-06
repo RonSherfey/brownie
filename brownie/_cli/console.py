@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 
+import builtins
 import code
 import importlib
 import inspect
@@ -11,6 +12,7 @@ from io import StringIO
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggest, Suggestion
 from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.defaults import load_key_bindings
@@ -46,6 +48,7 @@ def main():
     if project.check_for_project():
         active_project = project.load()
         active_project.load_config()
+        active_project._add_to_main_namespace()
         print(f"{active_project._name} is the active project.")
     else:
         active_project = None
@@ -77,6 +80,42 @@ class _Quitter:
         raise SystemExit(code)
 
 
+class ConsolePrinter:
+    """
+    Custom printer during console input.
+
+    Ensures that stdout of the active prompt buffer is preserved when the console
+    is written to during user imnut.
+    """
+
+    _builtins_print = builtins.print
+
+    def __init__(self, console):
+        self.console = console
+
+    def start(self):
+        builtins.print = self
+
+    def __call__(self, *values, sep=" ", end="\n", file=sys.stdout, flush=False):
+        if file != sys.stdout:
+            self._builtins_print(*values, sep=sep, end=end, file=file, flush=flush)
+            return
+
+        ps = sys.ps2 if self.console.buffer else sys.ps1
+        line = f"{ps}{self.console.prompt_session.app.current_buffer.text}"
+
+        # overwrite the prompt output with whitespace, in case the printed data is shorter
+        self.console.write(f"\r{' ' * len(line)}\r")
+
+        if not end.endswith("\n"):
+            end = "{end}\n"
+        text = f"{sep.join(str(i) for i in values)}{end}{line}"
+        self.console.write(text)
+
+    def finish(self):
+        builtins.print = self._builtins_print
+
+
 class Console(code.InteractiveConsole):
 
     # This value is used as the `input` arg when initializing `prompt_toolkit.PromptSession`.
@@ -84,7 +123,7 @@ class Console(code.InteractiveConsole):
     # replaced with `prompt_toolkit.input.defaults.create_pipe_input`
     prompt_input = None
 
-    def __init__(self, project=None, extra_locals=None):
+    def __init__(self, project=None, extra_locals=None, exit_on_continue=False):
         """
         Launch the Brownie console.
 
@@ -94,6 +133,9 @@ class Console(code.InteractiveConsole):
             Active Brownie project to include in the console's local namespace.
         extra_locals: dict, optional
             Additional variables to add to the console namespace.
+        exit_on_continue: bool, optional
+            If True, the `continue` command causes the console to
+            raise a SystemExit with error message "continue".
         """
         console_settings = CONFIG.settings["console"]
 
@@ -101,6 +143,11 @@ class Console(code.InteractiveConsole):
         locals_dict.update(
             _dir=dir, dir=self._dir, exit=_Quitter("exit"), quit=_Quitter("quit"), _console=self
         )
+
+        self.exit_on_continue = exit_on_continue
+        if exit_on_continue:
+            # add continue to the locals so we can quickly reach it via completion hints
+            locals_dict["continue"] = True
 
         if project:
             project._update_and_register(locals_dict)
@@ -128,6 +175,8 @@ class Console(code.InteractiveConsole):
             kwargs["auto_suggest"] = ConsoleAutoSuggest(self, locals_dict)
         if console_settings["completions"]:
             kwargs["completer"] = ConsoleCompleter(self, locals_dict)
+        if console_settings["editing_mode"]:
+            kwargs["editing_mode"] = EditingMode(console_settings["editing_mode"].upper())
 
         self.compile_mode = "single"
         self.prompt_session = PromptSession(
@@ -160,6 +209,7 @@ class Console(code.InteractiveConsole):
 
             colorama.init()
 
+        self.console_printer = ConsolePrinter(self)
         super().__init__(locals_dict)
 
     def _dir(self, obj=None):
@@ -196,7 +246,11 @@ class Console(code.InteractiveConsole):
             CONFIG.argv["cli"] = cli_mode
 
     def raw_input(self, prompt=""):
-        return self.prompt_session.prompt(prompt)
+        self.console_printer.start()
+        try:
+            return self.prompt_session.prompt(prompt)
+        finally:
+            self.console_printer.finish()
 
     def showsyntaxerror(self, filename):
         tb = color.format_tb(sys.exc_info()[1])
@@ -215,6 +269,10 @@ class Console(code.InteractiveConsole):
         mode = self.compile_mode
         self.compile_mode = "single"
 
+        if source == "continue" and self.exit_on_continue:
+            # used to differentiate exit and continue for pytest interactive debugging
+            raise SystemExit("continue")
+
         try:
             code = self.compile(source, filename, mode)
         except (OverflowError, SyntaxError, ValueError):
@@ -232,8 +290,8 @@ class Console(code.InteractiveConsole):
             pass
         self.runcode(code)
         if "__ret_value__" in self.locals and self.locals["__ret_value__"] is not None:
-            self._console_write(self.locals["__ret_value__"])
-            del self.locals["__ret_value__"]
+            return_value = self.locals.pop("__ret_value__")
+            self._console_write(return_value)
         return False
 
     def paste_event(self, event):

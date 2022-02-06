@@ -16,7 +16,7 @@ Brownie is a Python-based development and testing framework for smart contracts 
 ## Dependencies
 
 * [python3](https://www.python.org/downloads/release/python-368/) version 3.6 or greater, python3-dev
-* [ganache-cli](https://github.com/trufflesuite/ganache-cli) - tested with version [6.11.0](https://github.com/trufflesuite/ganache-cli/releases/tag/v6.11.0)
+* [ganache-cli](https://github.com/trufflesuite/ganache-cli) - tested with version [6.12.2](https://github.com/trufflesuite/ganache-cli/releases/tag/v6.12.2)
 
 ## Installation
 
@@ -66,6 +66,38 @@ cd brownie
 python3 setup.py install
 ```
 
+### as a library
+
+If you want to install brownie inside your own project (rather than as a standalone cli tool):
+
+```bash
+export BROWNIE_LIB=1
+pip install eth-brownie
+```
+
+This loosens the pins on all dependencies. You'll want to make sure you have your own `requirements.txt` to make sure upgrades upstream don't surprise anyone.
+
+### for development
+
+There are extra tools that are helpful when developing:
+
+```bash
+git clone https://github.com/eth-brownie/brownie.git
+cd brownie
+python3 -m venv venv
+./venv/bin/pip install wheel
+./venv/bin/pip install -e . -r requirements-dev.txt
+```
+
+Upgrading the pinned versions of dependencies is easy:
+```
+./venv/bin/pip-compile --upgrade
+./venv/bin/pip-compile --upgrade requirements-dev.in
+./venv/bin/pip-compile --upgrade requirements-windows.in
+```
+
+Even small upgrades of patch versions have broken things in the past, so be sure to run all tests after upgrading things!
+
 ## Quick Usage
 
 To initialize a new Brownie project, start by creating a new folder. From within that folder, type:
@@ -87,7 +119,7 @@ If you have any questions about how to use Brownie, feel free to ask on [Ethereu
 To run the tests, first install the developer dependencies:
 
 ```bash
-pip install -r requirements-dev.txt
+pip install -e . -r requirements-dev.txt
 ```
 
 Then use [`tox`](https://github.com/tox-dev/tox) to run the complete suite against the full set of build targets, or [`pytest`](https://github.com/pytest-dev/pytest) to run tests against a specific version of Python. If you are using [`pytest`](https://github.com/pytest-dev/pytest) you must include the `-p no:pytest-brownie` flag to prevent it from loading the Brownie plugin.
@@ -120,6 +152,34 @@ For example, to run the tests in `brownie/tests/test_format_input.py`:
 
 ```bash
 docker-compose exec sandbox bash -c 'python -m pytest tests/convert/test_format_input.py'
+```
+
+#### Attaching to dockerized RPC clients
+
+You can also attach to a RPC client already running inside a docker container.
+
+For example for running ganache-cli you could just startup the official ganache-cli docker image:
+
+```bash
+docker run -p 8545:8545 trufflesuite/ganache-cli
+```
+
+Then in another terminal on your host you could connect to it:
+
+```bash
+brownie console
+```
+
+If you have your RPC client bound to a specific hostname e.g. `ganache` you could create a separate brownie network for it:
+
+```bash
+brownie networks add Development dev cmd=ganache-cli host=http://ganache:8545
+```
+
+Then connect to it with:
+
+```bash
+brownie console --network dev
 ```
 
 ## Contributing

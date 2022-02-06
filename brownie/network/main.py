@@ -40,9 +40,9 @@ def connect(network: str = None, launch_rpc: bool = True) -> None:
         web3.connect(host, active.get("timeout", 30))
         if CONFIG.network_type == "development" and launch_rpc and not rpc.is_active():
             if is_connected():
-                if web3.eth.blockNumber != 0:
+                if web3.eth.block_number != 0:
                     warnings.warn(
-                        f"Development network has a block height of {web3.eth.blockNumber}",
+                        f"Development network has a block height of {web3.eth.block_number}",
                         BrownieEnvironmentWarning,
                     )
                 rpc.attach(host)
@@ -139,3 +139,48 @@ def gas_buffer(*args: Tuple[float, None]) -> Union[float, None]:
         else:
             raise TypeError("Invalid gas buffer - must be given as a float, int or None")
     return CONFIG.active_network["settings"]["gas_buffer"]
+
+
+def max_fee(*args: Tuple[Union[int, str, bool, None]]) -> Union[int, bool]:
+    """
+    Gets and optionally sets the default max fee per gas.
+
+    * If a Wei value is given, this will be the default max fee.
+    * If set to None or False, transactions will default to using gas price.
+    """
+    if not is_connected():
+        raise ConnectionError("Not connected to any network")
+    if args:
+        if args[0] in (None, False):
+            CONFIG.active_network["settings"]["max_fee"] = None
+        else:
+            try:
+                price = Wei(args[0])
+            except ValueError:
+                raise TypeError(f"Invalid max fee '{args[0]}'")
+            CONFIG.active_network["settings"]["max_fee"] = price
+    return CONFIG.active_network["settings"]["max_fee"]
+
+
+def priority_fee(*args: Tuple[Union[int, str, bool, None]]) -> Union[int, bool]:
+    """
+    Gets and optionally sets the default max priority fee per gas.
+
+    * If set to 'auto', the fee is set using `eth_maxPriorityFeePerGas`.
+    * If a Wei value is given, this will be the default max fee.
+    * If set to None or False, transactions will default to using gas price.
+    """
+    if not is_connected():
+        raise ConnectionError("Not connected to any network")
+    if args:
+        if args[0] in (None, False):
+            CONFIG.active_network["settings"]["priority_fee"] = None
+        elif args[0] == "auto":
+            CONFIG.active_network["settings"]["priority_fee"] = "auto"
+        else:
+            try:
+                price = Wei(args[0])
+            except ValueError:
+                raise TypeError(f"Invalid priority fee '{args[0]}'")
+            CONFIG.active_network["settings"]["priority_fee"] = price
+    return CONFIG.active_network["settings"]["priority_fee"]

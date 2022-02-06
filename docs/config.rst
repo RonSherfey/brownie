@@ -10,6 +10,8 @@ The configuration file must be saved as ``brownie-config.yaml``. If saved in the
 
 All configuration fields are optional. You can copy from the examples below and modify the settings as required.
 
+Configuration values can also be set using environment variables, as well as by specifying the `dotenv` top-level key.
+
 Default Configuration
 =====================
 
@@ -19,6 +21,23 @@ The following example shows all configuration settings and their default values:
     :linenos:
     :lines: 8-
     :language: yaml
+
+Variable Expansion
+==================
+
+Brownie supports POSIX-style variable expansion for environment variables.
+
+.. code-block:: yaml
+
+    networks:
+        default: ${DEFAULT_NETWORK}
+
+You can also provide defaults.
+
+.. code-block:: yaml
+
+    networks:
+        default: ${DEFAULT_NETWORK:-mainnet}
 
 Settings
 ========
@@ -94,6 +113,8 @@ Networks
                 gas_limit: max
                 gas_buffer: 1
                 gas_price: 0
+                max_fee: null
+                priority_fee: null
                 reverting_tx_gas_limit: max
                 default_contract_owner: true
                 cmd_settings:
@@ -116,7 +137,7 @@ Networks
 
     .. py:attribute:: gas_limit
 
-        The default gas limit for all transactions. If set to ``auto`` the gas limit is determined using ``web3.eth.estimateGas``. If set to ``max``, the block gas limit is used.
+        The default gas limit for all transactions. If set to ``auto`` the gas limit is determined using ``web3.eth.estimate_gas``. If set to ``max``, the block gas limit is used.
 
         development default: ``max``
 
@@ -124,7 +145,7 @@ Networks
 
     .. py:attribute:: gas_buffer
 
-        A modifier applied to ``web3.eth.estimateGas`` when determining gas price automatically.
+        A modifier applied to ``web3.eth.estimate_gas`` when determining gas price automatically.
 
         development default: ``1``
 
@@ -132,11 +153,23 @@ Networks
 
     .. py:attribute:: gas_price
 
-        The default gas price for all transactions. If set to ``auto`` the gas price is determined using ``web3.eth.gasPrice``.
+        The default gas price for all transactions. If set to ``auto`` the gas price is determined using ``web3.eth.gas_price``.
 
         development default: ``0``
 
         live default: ``auto``
+
+    .. py:attribute:: max_fee
+
+        The default max fee per gas for all transactions. If set to ``null``, transactions will default to legacy-style (using ``gas_price``).
+
+        default: ``null``
+
+    .. py:attribute:: priority_fee
+
+        The default max priority fee per gas for all transactions. If set to ``null``, transactions will default to legacy-style (using ``gas_price``).
+
+        default: ``null``
 
     .. py:attribute:: default_contract_owner
 
@@ -189,6 +222,23 @@ Compiler settings. See :ref:`compiler settings<compile_settings>` for more infor
               - zeppelin=/usr/local/lib/open-zeppelin/contracts/
               - github.com/ethereum/dapp-bin/=/usr/local/lib/dapp-bin/
 
+    .. py:attribute:: use_latest_patch
+
+        Optional boolean or array contract list to use the latest patch semver compiler version. E.g. the if the contract has pragma version `0.4.16` and the latest available patch for `0.4` is `0.4.22` it will use this instead for compilations.
+
+        Enable for all contracts:
+        .. code-block:: yaml
+            compiler:
+                solc:
+                    use_latest_patch: true
+
+        Enable for only specific contracts:
+        .. code-block:: yaml
+            compiler:
+                solc:
+                    use_latest_patch:
+                        - '0x514910771AF9Ca656af840dff83E8264EcF986CA'
+
 .. py:attribute:: compiler.vyper
 
     Settings specific to the Vyper compiler.
@@ -228,6 +278,12 @@ Console
 
     default value: ``true``
 
+.. py:attribute:: editing_mode
+
+    Choose between ``emacs`` and ``vi`` console editing modes.
+
+    default value: ``emacs``
+
 .. _config-reports:
 
 Reports
@@ -260,6 +316,12 @@ Settings related to reports such as coverage data and gas profiles.
             exclude_contracts:
                 - SafeMath
                 - Owned
+
+.. py:attribute:: only_include_project
+
+    If ``false``, reports also include contracts imported from outside the active project (such as those compiled via :func:`compile_source <main.compile_source>`).
+
+    default value: ``true``
 
 .. _config-hypothesis:
 
@@ -313,3 +375,11 @@ Other Settings
     This is useful if another application, such as a front end framework, needs access to deployment artifacts while you are on a development network.
 
     default value: ``false``
+
+.. py:attribute:: dotenv
+
+    If present, Brownie will load the .env file, resolving the file relative to the project root. Will fail loudly if .env file is missing.
+
+    .. code-block:: yaml
+
+        dotenv: .env

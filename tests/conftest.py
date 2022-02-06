@@ -15,7 +15,6 @@ from _pytest.monkeypatch import MonkeyPatch
 from ethpm._utils.ipfs import dummy_ipfs_pin
 from ethpm.backends.ipfs import BaseIPFSBackend
 from prompt_toolkit.input.defaults import create_pipe_input
-from semantic_version import Version
 
 import brownie
 from brownie._cli.console import Console
@@ -28,6 +27,7 @@ TARGET_OPTS = {
     "pm": "package_test",
     "plugin": "plugintester",
 }
+_dev_network = "development"
 
 
 def pytest_addoption(parser):
@@ -43,10 +43,19 @@ def pytest_addoption(parser):
         metavar=("solc_versions", "evm_rulesets", "optimizer_runs"),
         help="Run evm tests against a matrix of solc versions, evm versions, and compiler runs.",
     )
+    parser.addoption(
+        "--network",
+        choices=["development", "hardhat"],
+        default="development",
+    )
 
 
 # remove tests based on config flags and fixture names
 def pytest_collection_modifyitems(config, items):
+    if config.getoption("--network"):
+        global _dev_network
+        _dev_network = config.getoption("--network")
+
     if config.getoption("--evm"):
         target = "evm"
     else:
@@ -86,25 +95,9 @@ def pytest_generate_tests(metafunc):
         metafunc.parametrize("evmtester", params, indirect=True)
 
 
-# travis cannot call github ethereum/solidity API, so this method is patched
-def pytest_sessionstart(session):
-    if not session.config.getoption("--evm"):
-        monkeypatch_session = MonkeyPatch()
-        monkeypatch_session.setattr(
-            "solcx.get_installable_solc_versions",
-            lambda: [
-                Version("0.6.7"),
-                Version("0.6.2"),
-                Version("0.6.0"),
-                Version("0.5.15"),
-                Version("0.5.8"),
-                Version("0.5.7"),
-                Version("0.5.0"),
-                Version("0.4.25"),
-                Version("0.4.24"),
-                Version("0.4.22"),
-            ],
-        )
+@pytest.fixture(scope="session")
+def network_name():
+    return _dev_network
 
 
 # worker ID for xdist process, as an integer
@@ -117,7 +110,7 @@ def xdist_id(worker_id):
 
 # ensure a clean data folder, and set unique ganache ports for each xdist worker
 @pytest.fixture(scope="session", autouse=True)
-def _base_config(tmp_path_factory, xdist_id):
+def _base_config(tmp_path_factory, xdist_id, network_name):
     brownie._config.DATA_FOLDER = tmp_path_factory.mktemp(f"data-{xdist_id}")
     brownie._config._make_data_folders(brownie._config.DATA_FOLDER)
 
@@ -128,7 +121,7 @@ def _base_config(tmp_path_factory, xdist_id):
 
     if xdist_id:
         port = 8545 + xdist_id
-        brownie._config.CONFIG.networks["development"]["cmd_settings"]["port"] = port
+        brownie._config.CONFIG.networks[network_name]["cmd_settings"]["port"] = port
 
 
 @pytest.fixture(scope="session")
@@ -220,9 +213,9 @@ def evmtester(_project_factory, project, tmp_path, accounts, request):
 
 
 @pytest.fixture
-def plugintesterbase(project, testdir, monkeypatch):
+def plugintesterbase(project, testdir, monkeypatch, network_name):
     brownie.test.coverage.clear()
-    brownie.network.connect()
+    brownie.network.connect(network_name)
     monkeypatch.setattr("brownie.network.connect", lambda k: None)
     testdir.plugins.extend(["pytest-brownie", "pytest-cov"])
     yield testdir
@@ -244,8 +237,8 @@ def plugintester(_project_factory, plugintesterbase, request):
 
 # launches and connects to ganache, yields the brownie.network module
 @pytest.fixture
-def devnetwork(network, rpc, chain):
-    brownie.network.connect("development")
+def devnetwork(network, rpc, chain, network_name):
+    brownie.network.connect(network_name)
     yield brownie.network
     if rpc.is_active():
         chain.reset()

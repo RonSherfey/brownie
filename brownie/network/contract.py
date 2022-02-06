@@ -1,19 +1,19 @@
 #!/usr/bin/python3
 
+import io
 import json
 import os
 import re
 import time
 import warnings
-from collections import defaultdict
 from pathlib import Path
 from textwrap import TextWrapper
+from threading import get_ident  # noqa
 from typing import Any, Dict, Iterator, List, Match, Optional, Set, Tuple, Union
 from urllib.parse import urlparse
 
 import eth_abi
 import requests
-import solcast
 import solcx
 from eth_utils import remove_0x_prefix
 from hexbytes import HexBytes
@@ -21,7 +21,7 @@ from semantic_version import Version
 from vvm import get_installable_vyper_versions
 from vvm.utils.convert import to_vyper_version
 
-from brownie._config import BROWNIE_FOLDER, CONFIG, REQUEST_HEADERS
+from brownie._config import BROWNIE_FOLDER, CONFIG, REQUEST_HEADERS, _load_project_compiler_config
 from brownie.convert.datatypes import Wei
 from brownie.convert.normalize import format_input, format_output
 from brownie.convert.utils import (
@@ -38,9 +38,10 @@ from brownie.exceptions import (
     VirtualMachineError,
 )
 from brownie.project import compiler, ethpm
+from brownie.project.compiler.solidity import SOLIDITY_ERROR_CODES
+from brownie.project.flattener import Flattener
 from brownie.typing import AccountsType, TransactionReceiptType
 from brownie.utils import color
-from brownie.utils.toposort import toposort_flatten
 
 from . import accounts, chain
 from .event import _add_deployment_topics, _get_topics
@@ -55,6 +56,15 @@ from .state import (
 from .web3 import _resolve_address, web3
 
 _unverified_addresses: Set = set()
+
+_explorer_tokens = {
+    "etherscan": "ETHERSCAN_TOKEN",
+    "bscscan": "BSCSCAN_TOKEN",
+    "polygonscan": "POLYGONSCAN_TOKEN",
+    "ftmscan": "FTMSCAN_TOKEN",
+    "arbiscan": "ARBISCAN_TOKEN",
+    "snowtrace": "SNOWTRACE_TOKEN",
+}
 
 
 class _ContractBase:
@@ -112,11 +122,12 @@ class _ContractBase:
         if not isinstance(calldata, HexBytes):
             calldata = HexBytes(calldata)
 
+        fn_selector = calldata[:4].hex()  # type: ignore
         abi = next(
             (
                 i
                 for i in self.abi
-                if i["type"] == "function" and build_function_selector(i) == calldata[:4].hex()
+                if i["type"] == "function" and build_function_selector(i) == fn_selector
             ),
             None,
         )
@@ -151,6 +162,10 @@ class ContractContainer(_ContractBase):
         self.deploy = ContractConstructor(self, self._name)
         _revert_register(self)
 
+        # messes with tests if it is created on init
+        # instead we create when it's requested, but still define it here
+        self._flattener: Flattener = None  # type: ignore
+
     def __iter__(self) -> Iterator:
         return iter(self._contracts)
 
@@ -180,7 +195,7 @@ class ContractContainer(_ContractBase):
             i
             for i in self._contracts
             if (i.tx and i.tx.block_number is not None and i.tx.block_number > height)
-            or len(web3.eth.getCode(i.address).hex()) <= 4
+            or len(web3.eth.get_code(i.address).hex()) <= 4
         ]
         for contract in reverted:
             self.remove(contract)
@@ -255,115 +270,39 @@ class ContractContainer(_ContractBase):
                 "for vyper contracts. You need to verify the source manually"
             )
         elif language == "Solidity":
-            # Scan the AST tree for needed information
-            nodes_source = [
-                {"node": solcast.from_ast(self._build["ast"]), "src": self._build["source"]}
-            ]
-            for name in self._build["dependencies"]:
-                build_json = self._project._build.get(name)
-                if "ast" in build_json:
-                    nodes_source.append(
-                        {"node": solcast.from_ast(build_json["ast"]), "src": build_json["source"]}
+            if self._flattener is None:
+                source_fp = (
+                    Path(self._project._path)
+                    .joinpath(self._build["sourcePath"])
+                    .resolve()
+                    .as_posix()
+                )
+                config = self._project._compiler_config
+                remaps = dict(
+                    map(
+                        lambda s: s.split("=", 1),
+                        compiler._get_solc_remappings(config["solc"]["remappings"]),
                     )
+                )
+                libs = {lib.strip("_") for lib in re.findall("_{1,}[^_]*_{1,}", self.bytecode)}
+                compiler_settings = {
+                    "evmVersion": self._build["compiler"]["evm_version"],
+                    "optimizer": config["solc"]["optimizer"],
+                    "libraries": {
+                        Path(source_fp).name: {lib: self._project[lib][-1].address for lib in libs}
+                    },
+                }
+                self._flattener = Flattener(source_fp, self._name, remaps, compiler_settings)
 
-            pragma_statements = set()
-            global_structs = set()
-            global_enums = set()
-            import_aliases: Dict = defaultdict(list)
-            for n, src in [ns.values() for ns in nodes_source]:
-                for pragma in n.children(filters={"nodeType": "PragmaDirective"}):
-                    pragma_statements.add(src[slice(*pragma.offset)])
-
-                for enum in n.children(filters={"nodeType": "EnumDefinition"}):
-                    if enum.parent() == n:
-                        # parent == source node -> global enum
-                        global_enums.add(src[slice(*enum.offset)])
-
-                for struct in n.children(filters={"nodeType": "StructDefinition"}):
-                    if struct.parent() == n:
-                        # parent == source node -> global struct
-                        global_structs.add(src[(slice(*struct.offset))])
-
-                for imp in n.children(filters={"nodeType": "ImportDirective"}):
-                    if isinstance(imp.get("symbolAliases"), list):
-                        for symbol_alias in imp.get("symbolAliases"):
-                            if symbol_alias["local"] is not None:
-                                import_aliases[imp.get("absolutePath")].append(
-                                    symbol_alias["local"],
-                                )
-            has_abiencoder = "pragma experimental ABIEncoderV2;" in pragma_statements
-
-            # build dependency tree
-            dependency_tree: Dict = defaultdict(set)
-            dependency_tree["__root_node__"] = set(self._build["dependencies"])
-            for name in self._build["dependencies"]:
-                build_json = self._project._build.get(name)
-                if "dependencies" in build_json:
-                    dependency_tree[name].update(build_json["dependencies"])
-
-            # sort dependencies, process them and insert them into the flattened file
-            flattened_source = ""
-            for name in toposort_flatten(dependency_tree):
-                if name == "__root_node__":
-                    continue
-                build_json = self._project._build.get(name)
-                offset = build_json["offset"]
-                contract_name = build_json["contractName"]
-                source = self._slice_source(build_json["source"], offset)
-                # Check for import aliases and duplicate the contract with different name
-                if "sourcePath" in build_json:
-                    for alias in import_aliases[build_json["sourcePath"]]:
-                        # slice to contract definition and replace contract name
-                        a_source = build_json["source"][offset[0] :]
-                        a_source = re.sub(
-                            rf"^(abstract)?(\s*)({build_json['type']})(\s+)({contract_name})",
-                            rf"\1\2\3\4{alias}",
-                            a_source,
-                        )
-                        # restore source, adjust offsets and slice source
-                        a_source = f"{build_json['source'][:offset[0]]}{a_source}"
-                        a_offset = [offset[0], offset[1] + (len(alias) - len(contract_name))]
-                        a_source = self._slice_source(a_source, a_offset)
-                        # add alias source to flattened file
-                        a_name = f"{name} (Alias import as {alias})"
-                        flattened_source = f"{flattened_source}\n\n// Part: {a_name}\n\n{a_source}"
-
-                flattened_source = f"{flattened_source}\n\n// Part: {name}\n\n{source}"
-
-            # Top level contract, defines compiler and license
             build_json = self._build
-            version = build_json["compiler"]["version"]
-            version_short = re.findall(r"^[^+]+", version)[0]
-            offset = build_json["offset"]
-            source = self._slice_source(build_json["source"], offset)
-            file_name = Path(build_json["sourcePath"]).parts[-1]
-            licenses = re.findall(
-                r"SPDX-License-Identifier:(.*)\n", build_json["source"][: offset[0]]
-            )
-            license_identifier = licenses[0].strip() if len(licenses) >= 1 else "NONE"
-
-            # combine to final flattened source
-            lb = "\n"
-            abiencoder_str = "\npragma experimental ABIEncoderV2;"
-            is_global = len(global_enums) + len(global_structs) > 0
-            global_str = "// Global Enums and Structs\n\n" if is_global else ""
-            enum_structs = f"{lb.join(global_enums)}\n\n{lb.join(global_structs)}"
-            flattened_source = (
-                f"// SPDX-License-Identifier: {license_identifier}\n\n"
-                f"pragma solidity {version_short};"
-                f"{abiencoder_str if has_abiencoder else ''}\n\n{global_str}"
-                f"{enum_structs if is_global else ''}"
-                f"{flattened_source}\n\n"
-                f"// File: {file_name}\n\n{source}\n"
-            )
 
             return {
-                "flattened_source": flattened_source,
+                "standard_json_input": self._flattener.standard_input_json,
                 "contract_name": build_json["contractName"],
-                "compiler_version": version,
+                "compiler_version": build_json["compiler"]["version"],
                 "optimizer_enabled": build_json["compiler"]["optimizer"]["enabled"],
                 "optimizer_runs": build_json["compiler"]["optimizer"]["runs"],
-                "license_identifier": license_identifier,
+                "license_identifier": self._flattener.license,
                 "bytecode_len": len(build_json["bytecode"]),
             }
         else:
@@ -376,23 +315,26 @@ class ContractContainer(_ContractBase):
         url = CONFIG.active_network.get("explorer")
         if url is None:
             raise ValueError("Explorer API not set for this network")
-        if "etherscan" not in url:
+        env_token = next((v for k, v in _explorer_tokens.items() if k in url), None)
+        if env_token is None:
             raise ValueError(
-                "Publishing source is only supported on etherscan, change the Explorer API"
+                f"Publishing source is only supported on {', '.join(_explorer_tokens)},"
+                "change the Explorer API"
             )
 
-        if os.getenv("ETHERSCAN_TOKEN"):
-            api_key = os.getenv("ETHERSCAN_TOKEN")
+        if os.getenv(env_token):
+            api_key = os.getenv(env_token)
         else:
+            host = urlparse(url).netloc
+            host = host[host.index(".") + 1 :]
             raise ValueError(
-                "An Etherscan API token is required to verify contract source code. "
-                "Visit https://etherscan.io/register to obtain a token, and then store it "
-                "as the environment variable $ETHERSCAN_TOKEN"
+                f"An API token is required to verify contract source code. Visit https://{host}/ "
+                f"to obtain a token, and then store it as the environment variable ${env_token}"
             )
 
         address = _resolve_address(contract.address)
 
-        # Get flattened source code and contract/compiler information
+        # Get source code and contract/compiler information
         contract_info = self.get_verification_info()
 
         # Select matching license code (https://etherscan.io/contract-license-types)
@@ -453,7 +395,7 @@ class ContractContainer(_ContractBase):
                 if i >= 10:
                     raise ValueError(f"API request failed with: {data['result']}")
                 elif i == 0 and not silent:
-                    print("Waiting for etherscan to process contract...")
+                    print(f"Waiting for {url} to process contract...")
                 i += 1
                 time.sleep(10)
 
@@ -468,9 +410,9 @@ class ContractContainer(_ContractBase):
             "module": "contract",
             "action": "verifysourcecode",
             "contractaddress": address,
-            "sourceCode": contract_info["flattened_source"],
-            "codeformat": "solidity-single-file",
-            "contractname": contract_info["contract_name"],
+            "sourceCode": io.StringIO(json.dumps(self._flattener.standard_input_json)),
+            "codeformat": "solidity-standard-json-input",
+            "contractname": f"{self._flattener.contract_file}:{self._flattener.contract_name}",
             "compilerversion": f"v{contract_info['compiler_version']}",
             "optimizationUsed": 1 if contract_info["optimizer_enabled"] else 0,
             "runs": contract_info["optimizer_runs"],
@@ -588,7 +530,9 @@ class ContractConstructor:
             *args,
             amount=tx["value"],
             gas_limit=tx["gas"],
-            gas_price=tx["gasPrice"],
+            gas_price=tx.get("gas_price"),
+            max_fee=tx.get("max_fee"),
+            priority_fee=tx.get("priority_fee"),
             nonce=tx["nonce"],
             required_confs=tx["required_confs"],
             publish_source=publish_source,
@@ -639,9 +583,7 @@ class ContractConstructor:
                 "includes a `from` field specifying the sender of the transaction"
             )
 
-        return tx["from"].estimate_gas(
-            amount=tx["value"], gas_price=tx["gasPrice"], data=self.encode_input(*args)
-        )
+        return tx["from"].estimate_gas(amount=tx["value"], data=self.encode_input(*args))
 
 
 class InterfaceContainer:
@@ -701,11 +643,12 @@ class InterfaceConstructor:
         if not isinstance(calldata, HexBytes):
             calldata = HexBytes(calldata)
 
+        fn_selector = calldata[:4].hex()  # type: ignore
         abi = next(
             (
                 i
                 for i in self.abi
-                if i["type"] == "function" and build_function_selector(i) == calldata[:4].hex()
+                if i["type"] == "function" and build_function_selector(i) == fn_selector
             ),
             None,
         )
@@ -738,7 +681,7 @@ class _DeployedContractBase(_ContractBase):
         self, address: str, owner: Optional[AccountsType] = None, tx: TransactionReceiptType = None
     ) -> None:
         address = _resolve_address(address)
-        self.bytecode = web3.eth.getCode(address).hex()[2:]
+        self.bytecode = web3.eth.get_code(address).hex()[2:]
         if not self.bytecode:
             raise ContractNotFound(f"No contract deployed at {address}")
         self._owner = owner
@@ -771,11 +714,18 @@ class _DeployedContractBase(_ContractBase):
         if name == "balance":
             warnings.warn(
                 f"'{self._name}' defines a 'balance' function, "
-                f"'{self._name}.balance' is unavailable",
+                f"'{self._name}.balance' is available as {self._name}.wei_balance",
                 BrownieEnvironmentWarning,
             )
+            setattr(self, "wei_balance", self.balance)
         elif hasattr(self, name):
-            raise AttributeError(f"Namespace collision: '{self._name}.{name}'")
+            warnings.warn(
+                "Namespace collision between contract function and "
+                f"brownie `Contract` class member: '{self._name}.{name}'\n"
+                f"The {name} function will not be available when interacting with {self._name}",
+                BrownieEnvironmentWarning,
+            )
+            return
         setattr(self, name, obj)
 
     def __hash__(self) -> int:
@@ -831,7 +781,7 @@ class _DeployedContractBase(_ContractBase):
 
     def balance(self) -> Wei:
         """Returns the current ether balance of the contract, in wei."""
-        balance = web3.eth.getBalance(self.address)
+        balance = web3.eth.get_balance(self.address)
         return Wei(balance)
 
     def _deployment_path(self) -> Optional[Path]:
@@ -853,7 +803,7 @@ class _DeployedContractBase(_ContractBase):
         deployment_build["deployment"] = {
             "address": self.address,
             "chainid": chainid,
-            "blockHeight": web3.eth.blockNumber,
+            "blockHeight": web3.eth.block_number,
         }
         if path:
             self._project._add_to_deployment_map(self)
@@ -892,6 +842,8 @@ class Contract(_DeployedContractBase):
             Contract owner. If set, transactions without a `from` field
             will be performed using this account.
         """
+        address_or_alias = address_or_alias.strip()
+
         if args or kwargs:
             warnings.warn(
                 "Initializing `Contract` in this manner is deprecated."
@@ -917,9 +869,9 @@ class Contract(_DeployedContractBase):
                 or not CONFIG.active_network.get("explorer")
             ):
                 if not address:
-                    raise ValueError(f"Unknown alias: {address_or_alias}")
+                    raise ValueError(f"Unknown alias: '{address_or_alias}'")
                 else:
-                    raise ValueError(f"Unknown contract address: {address}")
+                    raise ValueError(f"Unknown contract address: '{address}'")
             contract = self.from_explorer(address, owner=owner, silent=True)
             build, sources = contract._build, contract._sources
             address = contract.address
@@ -1094,15 +1046,15 @@ class Contract(_DeployedContractBase):
 
         if as_proxy_for is None:
             # always check for an EIP1967 proxy - https://eips.ethereum.org/EIPS/eip-1967
-            implementation_eip1967 = web3.eth.getStorageAt(
+            implementation_eip1967 = web3.eth.get_storage_at(
                 address, int(web3.keccak(text="eip1967.proxy.implementation").hex(), 16) - 1
             )
             # always check for an EIP1822 proxy - https://eips.ethereum.org/EIPS/eip-1822
-            implementation_eip1822 = web3.eth.getStorageAt(address, web3.keccak(text="PROXIABLE"))
+            implementation_eip1822 = web3.eth.get_storage_at(address, web3.keccak(text="PROXIABLE"))
             if len(implementation_eip1967) > 0 and int(implementation_eip1967.hex(), 16):
-                as_proxy_for = _resolve_address(implementation_eip1967[12:])
+                as_proxy_for = _resolve_address(implementation_eip1967[-20:])
             elif len(implementation_eip1822) > 0 and int(implementation_eip1822.hex(), 16):
-                as_proxy_for = _resolve_address(implementation_eip1822[12:])
+                as_proxy_for = _resolve_address(implementation_eip1822[-20:])
             elif data["result"][0].get("Implementation"):
                 # for other proxy patterns, we only check if etherscan indicates
                 # the contract is a proxy. otherwise we could have a false positive
@@ -1136,7 +1088,8 @@ class Contract(_DeployedContractBase):
                 is_compilable = False
         else:
             try:
-                version = Version(compiler_str.lstrip("v")).truncate()
+                version = cls.get_solc_version(compiler_str, address)
+
                 is_compilable = (
                     version >= Version("0.4.22")
                     and version
@@ -1150,6 +1103,14 @@ class Contract(_DeployedContractBase):
                 warnings.warn(
                     f"{address}: target compiler '{compiler_str}' cannot be installed or is not "
                     "supported by Brownie. Some debugging functionality will not be available.",
+                    BrownieCompilerWarning,
+                )
+            return cls.from_abi(name, address, abi, owner)
+        elif data["result"][0]["OptimizationUsed"] in ("true", "false"):
+            if not silent:
+                warnings.warn(
+                    f"Blockscout explorer API has limited support by Brownie. "  # noqa
+                    "Some debugging functionality will not be available.",
                     BrownieCompilerWarning,
                 )
             return cls.from_abi(name, address, abi, owner)
@@ -1213,6 +1174,39 @@ class Contract(_DeployedContractBase):
         _DeployedContractBase.__init__(self, address, owner)
         _add_deployment(self)
         return self
+
+    @classmethod
+    def get_solc_version(cls, compiler_str: str, address: str) -> Version:
+        """
+        Return the solc compiler version either from the passed compiler string
+        or try to find the latest available patch semver compiler version.
+
+        Arguments
+        ---------
+        compiler_str: str
+            The compiler string passed from the contract metadata.
+        address: str
+            The contract address to check for.
+        """
+        version = Version(compiler_str.lstrip("v")).truncate()
+
+        compiler_config = _load_project_compiler_config(Path(os.getcwd()))
+        solc_config = compiler_config["solc"]
+        if "use_latest_patch" in solc_config:
+            use_latest_patch = solc_config["use_latest_patch"]
+            needs_patch_version = False
+            if isinstance(use_latest_patch, bool):
+                needs_patch_version = use_latest_patch
+            elif isinstance(use_latest_patch, list):
+                needs_patch_version = address in use_latest_patch
+
+            if needs_patch_version:
+                versions = [Version(str(i)) for i in solcx.get_installable_solc_versions()]
+                for v in filter(lambda l: l < version.next_minor(), versions):
+                    if v > version:
+                        version = v
+
+        return version
 
     def set_alias(self, alias: Optional[str]) -> None:
         """
@@ -1302,11 +1296,15 @@ class OverloadedMethod:
     def __len__(self) -> int:
         return len(self.methods)
 
-    def __call__(self, *args: Tuple) -> Any:
+    def __call__(
+        self, *args: Tuple, block_identifier: Union[int, str, bytes] = None, override: Dict = None
+    ) -> Any:
         fn = self._get_fn_from_args(args)
-        return fn(*args)  # type: ignore
+        return fn(*args, block_identifier=block_identifier, override=override)  # type: ignore
 
-    def call(self, *args: Tuple, block_identifier: Union[int, str, bytes] = None) -> Any:
+    def call(
+        self, *args: Tuple, block_identifier: Union[int, str, bytes] = None, override: Dict = None
+    ) -> Any:
         """
         Call the contract method without broadcasting a transaction.
 
@@ -1323,13 +1321,16 @@ class OverloadedMethod:
             A block number or hash that the call is executed at. If not given, the
             latest block used. Raises `ValueError` if this value is too far in the
             past and you are not using an archival node.
+        override : dict, optional
+            A mapping from addresses to balance, nonce, code, state, stateDiff
+            overrides for the context of the call.
 
         Returns
         -------
             Contract method return value(s).
         """
         fn = self._get_fn_from_args(args)
-        return fn.call(*args, block_identifier=block_identifier)
+        return fn.call(*args, block_identifier=block_identifier, override=override)
 
     def transact(self, *args: Tuple) -> TransactionReceiptType:
         """
@@ -1470,7 +1471,9 @@ class _ContractMethod:
         print(f"{self.abi['name']}({_inputs(self.abi)})")
         _print_natspec(self.natspec)
 
-    def call(self, *args: Tuple, block_identifier: Union[int, str, bytes] = None) -> Any:
+    def call(
+        self, *args: Tuple, block_identifier: Union[int, str, bytes] = None, override: Dict = None
+    ) -> Any:
         """
         Call the contract method without broadcasting a transaction.
 
@@ -1483,6 +1486,9 @@ class _ContractMethod:
             A block number or hash that the call is executed at. If not given, the
             latest block used. Raises `ValueError` if this value is too far in the
             past and you are not using an archival node.
+        override : dict, optional
+            A mapping from addresses to balance, nonce, code, state, stateDiff
+            overrides for the context of the call.
 
         Returns
         -------
@@ -1496,16 +1502,24 @@ class _ContractMethod:
         tx.update({"to": self._address, "data": self.encode_input(*args)})
 
         try:
-            data = web3.eth.call({k: v for k, v in tx.items() if v}, block_identifier)
+            data = web3.eth.call({k: v for k, v in tx.items() if v}, block_identifier, override)
         except ValueError as e:
             raise VirtualMachineError(e) from None
 
-        if HexBytes(data)[:4].hex() == "0x08c379a0":
+        selector = HexBytes(data)[:4].hex()
+
+        if selector == "0x08c379a0":
             revert_str = eth_abi.decode_abi(["string"], HexBytes(data)[4:])[0]
+            raise ValueError(f"Call reverted: {revert_str}")
+        elif selector == "0x4e487b71":
+            error_code = int(HexBytes(data)[4:].hex(), 16)
+            if error_code in SOLIDITY_ERROR_CODES:
+                revert_str = SOLIDITY_ERROR_CODES[error_code]
+            else:
+                revert_str = f"Panic (error code: {error_code})"
             raise ValueError(f"Call reverted: {revert_str}")
         if self.abi["outputs"] and not data:
             raise ValueError("No data was returned - the call likely reverted")
-
         return self.decode_output(data)
 
     def transact(self, *args: Tuple) -> TransactionReceiptType:
@@ -1535,8 +1549,10 @@ class _ContractMethod:
             self._address,
             tx["value"],
             gas_limit=tx["gas"],
-            gas_buffer=tx["gas_buffer"],
-            gas_price=tx["gasPrice"],
+            gas_buffer=tx.get("gas_buffer"),
+            gas_price=tx.get("gas_price"),
+            max_fee=tx.get("max_fee"),
+            priority_fee=tx.get("priority_fee"),
             nonce=tx["nonce"],
             required_confs=tx["required_confs"],
             data=self.encode_input(*args),
@@ -1624,7 +1640,6 @@ class _ContractMethod:
         return tx["from"].estimate_gas(
             to=self._address,
             amount=tx["value"],
-            gas_price=tx["gasPrice"],
             data=self.encode_input(*args),
         )
 
@@ -1673,7 +1688,9 @@ class ContractCall(_ContractMethod):
         Bytes4 method signature.
     """
 
-    def __call__(self, *args: Tuple, block_identifier: Union[int, str, bytes] = None) -> Any:
+    def __call__(
+        self, *args: Tuple, block_identifier: Union[int, str, bytes] = None, override: Dict = None
+    ) -> Any:
         """
         Call the contract method without broadcasting a transaction.
 
@@ -1686,6 +1703,9 @@ class ContractCall(_ContractMethod):
             A block number or hash that the call is executed at. If not given, the
             latest block used. Raises `ValueError` if this value is too far in the
             past and you are not using an archival node.
+        override : dict, optional
+            A mapping from addresses to balance, nonce, code, state, stateDiff
+            overrides for the context of the call.
 
         Returns
         -------
@@ -1693,7 +1713,7 @@ class ContractCall(_ContractMethod):
         """
 
         if not CONFIG.argv["always_transact"] or block_identifier is not None:
-            return self.call(*args, block_identifier=block_identifier)
+            return self.call(*args, block_identifier=block_identifier, override=override)
 
         args, tx = _get_tx(self._owner, args)
         tx.update({"gas_price": 0, "from": self._owner or accounts[0]})
@@ -1731,7 +1751,6 @@ def _get_tx(owner: Optional[AccountsType], args: Tuple) -> Tuple:
         "value": 0,
         "gas": None,
         "gas_buffer": None,
-        "gasPrice": None,
         "nonce": None,
         "required_confs": 1,
         "allow_revert": None,
@@ -1739,6 +1758,7 @@ def _get_tx(owner: Optional[AccountsType], args: Tuple) -> Tuple:
     if args and isinstance(args[-1], dict):
         tx.update(args[-1])
         args = args[:-1]
+        # key substitution to provide compatibility with web3.py
         for key, target in [("amount", "value"), ("gas_limit", "gas"), ("gas_price", "gasPrice")]:
             if key in tx:
                 tx[target] = tx[key]
@@ -1775,7 +1795,7 @@ def _inputs(abi: Dict) -> str:
 
 
 def _verify_deployed_code(address: str, expected_bytecode: str, language: str) -> bool:
-    actual_bytecode = web3.eth.getCode(address).hex()[2:]
+    actual_bytecode = web3.eth.get_code(address).hex()[2:]
     expected_bytecode = remove_0x_prefix(expected_bytecode)  # type: ignore
 
     if expected_bytecode.startswith("730000000000000000000000000000000000000000"):
@@ -1830,18 +1850,31 @@ def _fetch_from_explorer(address: str, action: str, silent: bool) -> Dict:
     if address in _unverified_addresses:
         raise ValueError(f"Source for {address} has not been verified")
 
+    code = web3.eth.get_code(address).hex()[2:]
+    # EIP-1167: Minimal Proxy Contract
+    if code[:20] == "363d3d373d3d3d363d73" and code[60:] == "5af43d82803e903d91602b57fd5bf3":
+        address = _resolve_address(code[20:60])
+    # Vyper <0.2.9 `create_forwarder_to`
+    elif (
+        code[:30] == "366000600037611000600036600073"
+        and code[70:] == "5af4602c57600080fd5b6110006000f3"
+    ):
+        address = _resolve_address(code[30:70])
+
     params: Dict = {"module": "contract", "action": action, "address": address}
-    if "etherscan" in url:
-        if os.getenv("ETHERSCAN_TOKEN"):
-            params["apiKey"] = os.getenv("ETHERSCAN_TOKEN")
+    explorer, env_key = next(
+        ((k, v) for k, v in _explorer_tokens.items() if k in url), (None, None)
+    )
+    if env_key is not None:
+        if os.getenv(env_key):
+            params["apiKey"] = os.getenv(env_key)
         elif not silent:
             warnings.warn(
-                "No Etherscan API token set. You may experience issues with rate limiting. "
-                "Visit https://etherscan.io/register to obtain a token, and then store it "
-                "as the environment variable $ETHERSCAN_TOKEN",
+                f"No {explorer} API token set. You may experience issues with rate limiting. "
+                f"Visit https://{explorer}.io/register to obtain a token, and then store it "
+                f"as the environment variable ${env_key}",
                 BrownieEnvironmentWarning,
             )
-
     if not silent:
         print(
             f"Fetching source of {color('bright blue')}{address}{color} "
@@ -1853,7 +1886,7 @@ def _fetch_from_explorer(address: str, action: str, silent: bool) -> Dict:
         raise ConnectionError(f"Status {response.status_code} when querying {url}: {response.text}")
     data = response.json()
     if int(data["status"]) != 1:
-        raise ValueError(f"Failed to retrieve data from API: {data['result']}")
+        raise ValueError(f"Failed to retrieve data from API: {data}")
 
     return data
 

@@ -3,10 +3,10 @@
 import pytest
 
 
-def test_connect(network, rpc, web3):
-    network.connect()
+def test_connect(network, rpc, web3, network_name):
+    network.connect(network_name)
     assert network.is_connected()
-    assert network.show_active() == "development"
+    assert network.show_active() == network_name
     assert rpc.is_active()
     assert web3.isConnected()
 
@@ -82,7 +82,7 @@ def test_gas_price_manual(devnetwork, accounts):
 def test_gas_price_auto(devnetwork, accounts, web3):
     devnetwork.gas_price(None)
     tx = accounts[0].transfer(accounts[1], 0)
-    assert tx.gas_price == web3.eth.gasPrice
+    assert tx.gas_price == web3.eth.gas_price
 
 
 def test_gas_price_raises(devnetwork):

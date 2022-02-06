@@ -1,23 +1,26 @@
 #!/usr/bin/python3
 
 import functools
+import re
 import sys
 import threading
 import time
+from collections import deque
 from enum import IntEnum
 from hashlib import sha1
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from warnings import warn
 
 import black
 import requests
 from eth_abi import decode_abi
 from hexbytes import HexBytes
-from web3.exceptions import TimeExhausted, TransactionNotFound
+from web3.exceptions import TransactionNotFound
 
 from brownie._config import CONFIG
 from brownie.convert import EthAddress, Wei
-from brownie.exceptions import RPCRequestError
+from brownie.exceptions import ContractNotFound, RPCRequestError
 from brownie.project import build
 from brownie.project import main as project_main
 from brownie.project.compiler.solidity import SOLIDITY_ERROR_CODES
@@ -29,6 +32,8 @@ from brownie.utils.output import build_tree
 from . import state
 from .event import EventDict, _decode_logs, _decode_trace
 from .web3 import web3
+
+_marker = deque("-/|\\-/|\\")
 
 
 def trace_property(fn: Callable) -> Any:
@@ -120,11 +125,12 @@ class TransactionReceipt:
     contract_name = None
     fn_name = None
     gas_used = None
-    logs = None
+    logs: Optional[List] = None
     nonce = None
     sender = None
     txid: str
     txindex = None
+    type: int
 
     def __init__(
         self,
@@ -152,8 +158,6 @@ class TransactionReceipt:
 
         if isinstance(txid, bytes):
             txid = HexBytes(txid).hex()
-        if not self._silent:
-            print(f"\rTransaction sent: {color('bright blue')}{txid}{color}")
 
         # this event is set once the transaction is confirmed or dropped
         # it is used to waiting during blocking transaction actions
@@ -191,7 +195,34 @@ class TransactionReceipt:
         if self._revert_pc is not None:
             self._dev_revert_msg = build._get_dev_revert(self._revert_pc) or None
 
-        self._await_transaction(required_confs, is_blocking)
+        tx: Dict = web3.eth.get_transaction(HexBytes(self.txid))
+        self._set_from_tx(tx)
+
+        if not self._silent:
+            output_str = ""
+            if self.type == 2:
+                max_gas = tx["maxFeePerGas"] / 10 ** 9
+                priority_gas = tx["maxPriorityFeePerGas"] / 10 ** 9
+                output_str = (
+                    f"  Max fee: {color('bright blue')}{max_gas}{color} gwei"
+                    f"   Priority fee: {color('bright blue')}{priority_gas}{color} gwei"
+                )
+            elif self.gas_price is not None:
+                gas_price = self.gas_price / 10 ** 9
+                output_str = f"  Gas price: {color('bright blue')}{gas_price}{color} gwei"
+            print(
+                f"{output_str}   Gas limit: {color('bright blue')}{self.gas_limit}{color}"
+                f"   Nonce: {color('bright blue')}{self.nonce}{color}"
+            )
+
+        # await confirmation of tx in a separate thread which is blocking if
+        # required_confs > 0 or tx has already confirmed (`blockNumber` != None)
+        confirm_thread = threading.Thread(
+            target=self._await_confirmation, args=(tx["blockNumber"], required_confs), daemon=True
+        )
+        confirm_thread.start()
+        if is_blocking and (required_confs > 0 or tx["blockNumber"]):
+            confirm_thread.join()
 
     def __repr__(self) -> str:
         color_str = {-2: "dark white", -1: "bright yellow", 0: "bright red", 1: ""}[self.status]
@@ -204,7 +235,10 @@ class TransactionReceipt:
     def events(self) -> Optional[EventDict]:
         if self._events is None:
             if self.status:
-                self._events = _decode_logs(self.logs)  # type: ignore
+                # relay contract map so we can decode ds-note logs
+                addrs = {log.address for log in self.logs} if self.logs else set()
+                contracts = {addr: state._find_contract(addr) for addr in addrs}
+                self._events = _decode_logs(self.logs, contracts=contracts)  # type: ignore
             else:
                 self._get_trace()
                 # get events from the trace - handled lazily so that other
@@ -268,7 +302,8 @@ class TransactionReceipt:
     def subcalls(self) -> Optional[List]:
         if self._subcalls is None:
             self._expand_trace()
-        return self._subcalls
+        subcalls = filter(lambda s: not _is_call_to_precompile(s), self._subcalls)  # type: ignore
+        return list(subcalls)
 
     @trace_property
     def trace(self) -> Optional[List]:
@@ -280,13 +315,13 @@ class TransactionReceipt:
     def timestamp(self) -> Optional[int]:
         if self.status < 0:
             return None
-        return web3.eth.getBlock(self.block_number)["timestamp"]
+        return web3.eth.get_block(self.block_number)["timestamp"]
 
     @property
     def confirmations(self) -> int:
         if not self.block_number:
             return 0
-        return web3.eth.blockNumber - self.block_number + 1
+        return web3.eth.block_number - self.block_number + 1
 
     def replace(
         self,
@@ -303,9 +338,12 @@ class TransactionReceipt:
         ---------
         increment : float, optional
             Multiplier applied to the gas price of this transaction in order
-            to determine the new gas price
+            to determine the new gas price. For EIP1559 transactions the multiplier
+            is applied to the max_fee, the priority_fee is incremented by 1.1.
         gas_price : Wei, optional
-            Absolute gas price to use in the replacement transaction
+            Absolute gas price to use in the replacement transaction. For EIP1559
+            transactions this is the new max_fee, the priority_fee is incremented
+            by 1.1.
         silent : bool, optional
             Toggle console verbosity (default is same setting as this transaction)
 
@@ -321,8 +359,17 @@ class TransactionReceipt:
         if self.status > -1:
             raise ValueError("Transaction has already confirmed")
 
-        if increment is not None:
-            gas_price = Wei(self.gas_price * increment)
+        if self.gas_price is not None:
+            if increment is not None:
+                gas_price = Wei(self.gas_price * increment)
+            else:
+                gas_price = Wei(gas_price)
+
+        max_fee, priority_fee = None, None
+        if self.max_fee is not None and self.priority_fee is not None:
+            max_fee = gas_price
+            priority_fee = Wei(self.priority_fee * 1.1)
+            gas_price = None
 
         if silent is None:
             silent = self._silent
@@ -342,7 +389,9 @@ class TransactionReceipt:
             self.receiver,
             self.value,
             gas_limit=self.gas_limit,
-            gas_price=Wei(gas_price),
+            gas_price=gas_price,
+            max_fee=max_fee,
+            priority_fee=priority_fee,
             data=self.input,
             nonce=self.nonce,
             required_confs=0,
@@ -358,11 +407,11 @@ class TransactionReceipt:
 
         while True:
             try:
-                tx: Dict = web3.eth.getTransaction(self.txid)
+                tx: Dict = web3.eth.get_transaction(self.txid)
                 break
             except TransactionNotFound:
                 if self.nonce is not None:
-                    sender_nonce = web3.eth.getTransactionCount(str(self.sender))
+                    sender_nonce = web3.eth.get_transaction_count(str(self.sender))
                     if sender_nonce > self.nonce:
                         self.status = Status(-2)
                         self._confirmed.set()
@@ -387,87 +436,79 @@ class TransactionReceipt:
             source = self._traceback_string()
         else:
             source = self._error_string(1)
+            contract = state._find_contract(self.receiver)
+            if contract:
+                marker = "//" if contract._build["language"] == "Solidity" else "#"
+                line = self._traceback_string().split("\n")[-1]
+                if marker + " dev: " in line:
+                    self._dev_revert_msg = line[line.index(marker) + len(marker) : -5].strip()
+
         raise exc._with_attr(
             source=source, revert_msg=self._revert_msg, dev_revert_msg=self._dev_revert_msg
         )
 
-    def _await_transaction(self, required_confs: int, is_blocking: bool) -> None:
-        # await tx showing in mempool
-        while True:
-            try:
-                tx: Dict = web3.eth.getTransaction(HexBytes(self.txid))
-                break
-            except (TransactionNotFound, ValueError):
-                if self.sender is None:
-                    # if sender was not explicitly set, this transaction was
-                    # not broadcasted locally and so likely doesn't exist
-                    raise
-                if self.nonce is not None:
-                    sender_nonce = web3.eth.getTransactionCount(str(self.sender))
-                    if sender_nonce > self.nonce:
-                        self.status = Status(-2)
-                        return
-                time.sleep(1)
-
-        self._set_from_tx(tx)
-
-        if not self._silent:
-            print(
-                f"  Gas price: {color('bright blue')}{self.gas_price / 10 ** 9}{color} gwei"
-                f"   Gas limit: {color('bright blue')}{self.gas_limit}{color}"
-                f"   Nonce: {color('bright blue')}{self.nonce}{color}"
-            )
-
-        # await confirmation of tx in a separate thread which is blocking if
-        # required_confs > 0 or tx has already confirmed (`blockNumber` != None)
-        confirm_thread = threading.Thread(
-            target=self._await_confirmation, args=(tx["blockNumber"], required_confs), daemon=True
-        )
-        confirm_thread.start()
-        if is_blocking and (required_confs > 0 or tx["blockNumber"]):
-            confirm_thread.join()
-
     def _await_confirmation(self, block_number: int = None, required_confs: int = 1) -> None:
-        block_number = block_number or self.block_number
-        if not block_number and not self._silent and required_confs > 0:
-            if required_confs == 1:
-                sys.stdout.write("\rWaiting for confirmation... ")
-            else:
-                sys.stdout.write(
-                    f"\rRequired confirmations: {color('bright yellow')}0/{required_confs}{color}"
-                )
-            sys.stdout.flush()
-
         # await first confirmation
+        block_number = block_number or self.block_number
+        nonce_time = 0.0
+        sender_nonce = 0
         while True:
-            # if sender nonce is greater than tx nonce, the tx should be confirmed
-            sender_nonce = web3.eth.getTransactionCount(str(self.sender))
-            expect_confirmed = bool(sender_nonce > self.nonce)  # type: ignore
+            # every 15 seconds, check if the nonce increased without a confirmation of
+            # this specific transaction. if this happens, the tx has likely dropped
+            # and we should stop waiting.
+            if time.time() - nonce_time > 15:
+                sender_nonce = web3.eth.get_transaction_count(str(self.sender))
+                nonce_time = time.time()
+
             try:
-                receipt = web3.eth.waitForTransactionReceipt(
-                    HexBytes(self.txid), timeout=15, poll_latency=1
-                )
+                receipt = web3.eth.get_transaction_receipt(HexBytes(self.txid))
+            except TransactionNotFound:
+                receipt = None
+            # the null blockHash check is required for older versions of Parity
+            # taken from `web3._utils.transactions.wait_for_transaction_receipt`
+            if receipt is not None and receipt["blockHash"] is not None:
                 break
-            except TimeExhausted:
-                if expect_confirmed:
-                    # if we expected confirmation based on the nonce, tx likely dropped
-                    self.status = Status(-2)
-                    self._confirmed.set()
-                    return
+
+            # continuation of the nonce logic 2 sections prior. we must check the receipt
+            # after querying the nonce, because in the other order there is a chance that
+            # the tx would confirm after checking the receipt but before checking the nonce
+            if sender_nonce > self.nonce:  # type: ignore
+                self.status = Status(-2)
+                self._confirmed.set()
+                return
+
+            if not block_number and not self._silent and required_confs > 0:
+                if required_confs == 1:
+                    sys.stdout.write(f"  Waiting for confirmation... {_marker[0]}\r")
+                else:
+                    sys.stdout.write(
+                        f"  Required confirmations: {color('bright yellow')}0/"
+                        f"{required_confs}{color}   {_marker[0]}\r"
+                    )
+                _marker.rotate(1)
+                sys.stdout.flush()
+
+            time.sleep(1)
+
+        # silence other dropped tx's immediately after confirmation to avoid output weirdness
+        for dropped_tx in state.TxHistory().filter(
+            sender=self.sender, nonce=self.nonce, key=lambda k: k != self
+        ):
+            dropped_tx._silent = True
 
         self.block_number = receipt["blockNumber"]
         # wait for more confirmations if required and handle uncle blocks
         remaining_confs = required_confs
         while remaining_confs > 0 and required_confs > 1:
             try:
-                receipt = web3.eth.getTransactionReceipt(self.txid)
+                receipt = web3.eth.get_transaction_receipt(self.txid)
                 self.block_number = receipt["blockNumber"]
             except TransactionNotFound:
                 if not self._silent:
                     sys.stdout.write(f"\r{color('red')}Transaction was lost...{color}{' ' * 8}")
                     sys.stdout.flush()
                 # check if tx is still in mempool, this will raise otherwise
-                tx = web3.eth.getTransaction(self.txid)
+                tx = web3.eth.get_transaction(self.txid)
                 self.block_number = None
                 return self._await_confirmation(tx["blockNumber"], required_confs)
             if required_confs - self.confirmations != remaining_confs:
@@ -507,16 +548,27 @@ class TransactionReceipt:
             self.sender = EthAddress(tx["from"])
         self.receiver = EthAddress(tx["to"]) if tx["to"] else None
         self.value = Wei(tx["value"])
-        self.gas_price = tx["gasPrice"]
+        self.gas_price = tx.get("gasPrice")
+        self.max_fee = tx.get("maxFeePerGas")
+        self.priority_fee = tx.get("maxPriorityFeePerGas")
         self.gas_limit = tx["gas"]
         self.input = tx["input"]
         self.nonce = tx["nonce"]
+        self.type = int(HexBytes(tx.get("type", 0)).hex(), 16)
 
         # if receiver is a known contract, set function name
-        if not self.fn_name and state._find_contract(tx["to"]) is not None:
+        if self.fn_name:
+            return
+        try:
             contract = state._find_contract(tx["to"])
-            self.contract_name = contract._name
-            self.fn_name = contract.get_method(tx["input"])
+            if contract is not None:
+                self.contract_name = contract._name
+                self.fn_name = contract.get_method(tx["input"])
+        except ContractNotFound:
+            # required in case the contract has self destructed
+            # other aspects of functionality will be broken, but this way we
+            # can at least return a receipt
+            pass
 
     def _set_from_receipt(self, receipt: Dict) -> None:
         """Sets object attributes based on the transaction reciept."""
@@ -525,6 +577,8 @@ class TransactionReceipt:
         self.gas_used = receipt["gasUsed"]
         self.logs = receipt["logs"]
         self.status = Status(receipt["status"])
+        if "effectiveGasPrice" in receipt:
+            self.gas_price = receipt["effectiveGasPrice"]
 
         self.contract_address = receipt["contractAddress"]
         if self.contract_address and not self.contract_name:
@@ -537,7 +591,7 @@ class TransactionReceipt:
         self.coverage_hash = sha1(base.encode()).hexdigest()
 
         if self.fn_name:
-            state.TxHistory()._gas(self._full_name(), receipt["gasUsed"])
+            state.TxHistory()._gas(self._full_name(), receipt["gasUsed"], self.status == Status(1))
 
     def _confirm_output(self) -> str:
         status = ""
@@ -545,11 +599,13 @@ class TransactionReceipt:
             revert_msg = self.revert_msg if web3.supports_traces else None
             status = f"({color('bright red')}{revert_msg or 'reverted'}{color}) "
         result = (
-            f"\r  {self._full_name()} confirmed {status}- "
+            f"\r  {self._full_name()} confirmed {status}  "
             f"Block: {color('bright blue')}{self.block_number}{color}   "
             f"Gas used: {color('bright blue')}{self.gas_used}{color} "
             f"({color('bright blue')}{self.gas_used / self.gas_limit:.2%}{color})"
         )
+        if self.type == 2 and self.gas_price is not None:
+            result += f"   Gas price: {color('bright blue')}{self.gas_price / 10 ** 9}{color} gwei"
         if self.status and self.contract_address:
             result += (
                 f"\n  {self.contract_name} deployed at: "
@@ -594,12 +650,32 @@ class TransactionReceipt:
             self._modified_state = False
             return
 
-        if isinstance(trace[0]["gas"], str):
-            # handle traces where numeric values are returned as hex (Nethermind)
+        # different nodes return slightly different formats. its really fun to handle
+        # geth/nethermind returns unprefixed and with 0-padding for stack and memory
+        # erigon returns 0x-prefixed and without padding (but their memory values are like geth)
+        fix_stack = False
+        for step in trace:
+            if not step["stack"]:
+                continue
+            check = step["stack"][0]
+            if not isinstance(check, str):
+                break
+            if check.startswith("0x"):
+                fix_stack = True
+                break
+
+        fix_gas = isinstance(trace[0]["gas"], str)
+
+        if fix_stack or fix_gas:
             for step in trace:
-                step["gas"] = int(step["gas"], 16)
-                step["gasCost"] = int.from_bytes(HexBytes(step["gasCost"]), "big", signed=True)
-                step["pc"] = int(step["pc"], 16)
+                if fix_stack:
+                    # for stack values, we need 32 bytes (64 chars) without the 0x prefix
+                    step["stack"] = [HexBytes(s).hex()[2:].zfill(64) for s in step["stack"]]
+                if fix_gas:
+                    # handle traces where numeric values are returned as hex (Nethermind)
+                    step["gas"] = int(step["gas"], 16)
+                    step["gasCost"] = int.from_bytes(HexBytes(step["gasCost"]), "big", signed=True)
+                    step["pc"] = int(step["pc"], 16)
 
         if self.status:
             self._confirmed_trace(trace)
@@ -615,9 +691,12 @@ class TransactionReceipt:
         if contract:
             data = _get_memory(trace[-1], -1)
             fn = contract.get_method_object(self.input)
+            if not fn:
+                warn(f"Unable to find function on {contract} for input {self.input}")
+                return
             self._return_value = fn.decode_output(data)
 
-    def _reverted_trace(self, trace: Sequence,) -> None:
+    def _reverted_trace(self, trace: Sequence) -> None:
         self._modified_state = False
         if self.contract_address:
             step = next((i for i in trace if i["op"] == "CODECOPY"), None)
@@ -633,14 +712,20 @@ class TransactionReceipt:
             if step["op"] == "REVERT" and int(step["stack"][-2], 16):
                 # get returned error string from stack
                 data = _get_memory(step, -1)
-                if data[:4].hex() == "0x4e487b71":  # keccak of Panic(uint256)
+
+                selector = data[:4].hex()
+
+                if selector == "0x4e487b71":  # keccak of Panic(uint256)
                     error_code = int(data[4:].hex(), 16)
                     if error_code in SOLIDITY_ERROR_CODES:
                         self._revert_msg = SOLIDITY_ERROR_CODES[error_code]
                     else:
                         self._revert_msg = f"Panic (error code: {error_code})"
-                else:
+                elif selector == "0x08c379a0":  # keccak of Error(string)
                     self._revert_msg = decode_abi(["string"], data[4:])[0]
+                else:
+                    # TODO: actually parse the data
+                    self._revert_msg = f"typed error: {data.hex()}"
 
             elif self.contract_address:
                 self._revert_msg = "invalid opcode" if step["op"] == "INVALID" else ""
@@ -667,11 +752,16 @@ class TransactionReceipt:
 
                     # if this is the optimizer revert, find the actual source
                     if "optimizer_revert" in pc_map[step["pc"]]:
-                        idx = trace.index(step)
-                        while trace[idx]["op"] != "JUMPDEST":
-                            # look for the most recent jump
+                        idx = trace.index(step) - 1
+
+                        # look for the most recent jump
+                        while trace[idx + 1]["op"] != "JUMPDEST":
+                            if trace[idx]["source"] != step["source"]:
+                                # if we find another line with a differing source offset prior
+                                # to a JUMPDEST, the optimizer revert is also the actual revert
+                                idx = trace.index(step)
+                                break
                             idx -= 1
-                        idx -= 1
                         while not trace[idx]["source"]:
                             # now we're in a yul optimization, keep stepping back
                             # until we find a source offset
@@ -697,7 +787,7 @@ class TransactionReceipt:
                             self._dev_revert_msg = revert_str
 
                     if self._revert_msg is None:
-                        self._revert_msg = self._dev_revert_msg
+                        self._revert_msg = self._dev_revert_msg or ""
                     return
                 except (KeyError, AttributeError, TypeError, ValueError):
                     pass
@@ -707,8 +797,8 @@ class TransactionReceipt:
                     self._dev_revert_msg = ""
                 return
 
-        step = next(i for i in trace[::-1] if i["op"] in ("REVERT", "INVALID"))
-        self._revert_msg = "invalid opcode" if step["op"] == "INVALID" else ""
+        op = next((i["op"] for i in trace[::-1] if i["op"] in ("REVERT", "INVALID")), None)
+        self._revert_msg = "invalid opcode" if op == "INVALID" else ""
 
     def _expand_trace(self) -> None:
         """Adds the following attributes to each step of the stack trace:
@@ -757,10 +847,13 @@ class TransactionReceipt:
         # last_map gives a quick reference of previous values at each depth
         last_map = {0: _get_last_map(self.receiver, self.input[:10])}  # type: ignore
         coverage_eval: Dict = {last_map[0]["name"]: {}}
-
+        precompile_contract = re.compile(r"0x0{38}(?:0[1-9]|1[0-8])")
+        call_opcodes = ("CALL", "STATICCALL", "DELEGATECALL")
         for i in range(len(trace)):
             # if depth has increased, tx has called into a different contract
-            if trace[i]["depth"] > trace[i - 1]["depth"]:
+            is_depth_increase = trace[i]["depth"] > trace[i - 1]["depth"]
+            is_subcall = trace[i - 1]["op"] in call_opcodes
+            if is_depth_increase or is_subcall:
                 step = trace[i - 1]
                 if step["op"] in ("CREATE", "CREATE2"):
                     # creating a new contract
@@ -780,15 +873,16 @@ class TransactionReceipt:
                     sig = calldata[:4].hex()
                     address = step["stack"][-2][-40:]
 
-                last_map[trace[i]["depth"]] = _get_last_map(address, sig)
-                coverage_eval.setdefault(last_map[trace[i]["depth"]]["name"], {})
+                if is_depth_increase:
+                    last_map[trace[i]["depth"]] = _get_last_map(address, sig)
+                    coverage_eval.setdefault(last_map[trace[i]["depth"]]["name"], {})
 
                 self._subcalls.append(
                     {"from": step["address"], "to": EthAddress(address), "op": step["op"]}
                 )
                 if step["op"] in ("CALL", "CALLCODE"):
                     self._subcalls[-1]["value"] = int(step["stack"][-3], 16)
-                if calldata and last_map[trace[i]["depth"]].get("function"):
+                if is_depth_increase and calldata and last_map[trace[i]["depth"]].get("function"):
                     fn = last_map[trace[i]["depth"]]["function"]
                     self._subcalls[-1]["function"] = fn._input_sig
                     try:
@@ -797,8 +891,12 @@ class TransactionReceipt:
                         self._subcalls[-1]["inputs"] = inputs
                     except Exception:
                         self._subcalls[-1]["calldata"] = calldata.hex()
-                elif calldata:
-                    self._subcalls[-1]["calldata"] = calldata.hex()
+                elif calldata or is_subcall:
+                    self._subcalls[-1]["calldata"] = calldata.hex()  # type: ignore
+
+                if precompile_contract.search(str(self._subcalls[-1]["from"])) is not None:
+                    caller = self._subcalls.pop(-2)["from"]
+                    self._subcalls[-1]["from"] = caller
 
             # update trace from last_map
             last = last_map[trace[i]["depth"]]
@@ -896,8 +994,11 @@ class TransactionReceipt:
         )
 
     def _add_internal_xfer(self, from_: str, to: str, value: str) -> None:
+        if not value.startswith("0x"):
+            value = f"0x{value}"
+
         self._internal_transfers.append(  # type: ignore
-            {"from": EthAddress(from_), "to": EthAddress(to), "value": Wei(f"0x{value}")}
+            {"from": EthAddress(from_), "to": EthAddress(to), "value": Wei(value)}
         )
 
     def _full_name(self) -> str:
@@ -1092,7 +1193,10 @@ class TransactionReceipt:
         except StopIteration:
             return ""
 
-        result = [next(i for i in trace_range if trace[i]["source"])]
+        try:
+            result = [next(i for i in trace_range if trace[i]["source"])]
+        except StopIteration:
+            return ""
         depth, jump_depth = trace[idx]["depth"], trace[idx]["jumpDepth"]
 
         while True:
@@ -1321,9 +1425,14 @@ def _get_last_map(address: EthAddress, sig: str) -> Dict:
         if isinstance(contract._project, project_main.Project):
             # only evaluate coverage for contracts that are part of a `Project`
             last_map["coverage"] = True
-            if contract._build["language"] == "Solidity":
+            if contract._build.get("language") == "Solidity":
                 last_map["active_branches"] = set()
     else:
         last_map.update(contract=None, internal_calls=[f"<UnknownContract>.{sig}"], pc_map=None)
 
     return last_map
+
+
+def _is_call_to_precompile(subcall: dict) -> bool:
+    precompile_contract = re.compile(r"0x0{38}(?:0[1-9]|1[0-8])")
+    return True if precompile_contract.search(str(subcall["to"])) is not None else False

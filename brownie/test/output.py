@@ -74,6 +74,7 @@ def _build_gas_profile_output():
 
     lines = [""]
 
+    only_include_project = CONFIG.settings["reports"]["only_include_project"]
     for full_name, values in sorted_gas:
         contract, function = full_name.split(".", 1)
 
@@ -82,7 +83,8 @@ def _build_gas_profile_output():
                 continue
         except (AttributeError, KeyError):
             # filters contracts that are not part of the project
-            continue
+            if only_include_project:
+                continue
         if contract in exclude_contracts:
             continue
 
@@ -108,8 +110,8 @@ def _build_gas_profile_output():
             values["avg"] = int(values["avg"])
             values = {k: str(v).rjust(padding[k]) for k, v in values.items()}
             lines.append(
-                f"   {prefix} {fn_name} -  avg: {values['avg']}"
-                f"  low: {values['low']}  high: {values['high']}"
+                f"   {prefix} {fn_name} -  avg: {values['avg']}  avg (confirmed):"
+                f" {values['avg_success']}  low: {values['low']}  high: {values['high']}"
             )
 
     return lines + [""]
@@ -221,11 +223,14 @@ def _split_by_fn(build, coverage_eval):
 
 def _split(coverage_eval, coverage_map, key):
     results = {}
-    for fn, map_ in coverage_map["statements"][key].items():
-        results[fn] = [[i for i in map_ if int(i) in coverage_eval[0]], [], []]
-    for fn, map_ in coverage_map["branches"][key].items():
-        results[fn][1] = [i for i in map_ if int(i) in coverage_eval[1]]
-        results[fn][2] = [i for i in map_ if int(i) in coverage_eval[2]]
+    branches = coverage_map["branches"][key]
+    statements = coverage_map["statements"][key]
+    for fn in branches.keys() & statements.keys():
+        results[fn] = [
+            [i for i in statements[fn] if int(i) in coverage_eval[0]],
+            [i for i in branches[fn] if int(i) in coverage_eval[1]],
+            [i for i in branches[fn] if int(i) in coverage_eval[2]],
+        ]
     return results
 
 
@@ -233,7 +238,7 @@ def _statement_totals(coverage_eval, coverage_map, exclude_contracts):
     result = {}
     count, total = 0, 0
     for path, fn in [(k, x) for k, v in coverage_eval.items() for x in v]:
-        if fn.split(".")[0] in exclude_contracts:
+        if fn.split(".")[0] in exclude_contracts or fn not in coverage_eval[path]:
             continue
         count += len(coverage_eval[path][fn][0])
         total += len(coverage_map[path][fn])
@@ -247,7 +252,7 @@ def _branch_totals(coverage_eval, coverage_map, exclude_contracts):
     for path, fn in [(k, x) for k, v in coverage_map.items() for x in v]:
         if fn.split(".")[0] in exclude_contracts:
             continue
-        if path not in coverage_eval:
+        if path not in coverage_eval or fn not in coverage_eval[path]:
             true, false = 0, 0
         else:
             true = len(coverage_eval[path][fn][2])

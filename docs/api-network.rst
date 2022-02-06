@@ -62,7 +62,7 @@ The ``main`` module contains methods for conncting to or disconnecting from the 
 
     * If no argument is given, the current default is displayed.
     * If an integer value is given, this will be the default gas limit.
-    * If set to ``auto``, the gas limit is determined automatically via :meth:`web3.eth.estimateGas <web3.eth.Eth.estimateGas>`.
+    * If set to ``"auto"``, the gas limit is determined automatically via :meth:`web3.eth.estimate_gas <web3.eth.Eth.estimate_gas>`.
 
     Returns ``False`` if the gas limit is set automatically, or an ``int`` if it is set to a fixed value.
 
@@ -99,7 +99,7 @@ The ``main`` module contains methods for conncting to or disconnecting from the 
     Gets and optionally sets the default gas price.
 
     * If an integer value is given, this will be the default gas price.
-    * If set to ``auto``, the gas price is determined automatically via :attr:`web3.eth.gasPrice <web3.eth.Eth.gasPrice>`.
+    * If set to ``"auto"``, the gas price is determined automatically via :attr:`web3.eth.gas_price <web3.eth.Eth.gas_price>`.
 
     Returns ``False`` if the gas price is set automatically, or an ``int`` if it is set to a fixed value.
 
@@ -114,6 +114,41 @@ The ``main`` module contains methods for conncting to or disconnecting from the 
         1200000000
         >>> network.gas_price("auto")
         False
+
+.. py:method:: main.max_fee(*args)
+
+    Gets and optionally sets the default max fee per gas.
+
+    * If an integer value is given, this will be the default max fee.
+    * If set to ``None`` or ``False``, transactions will instead default to using a legacy-style ``gas_price``.
+
+    .. code-block:: python
+
+        >>> from brownie import network
+        >>> network.max_fee()
+        None
+        >>> network.max_fee(10000000000)
+        10000000000
+        >>> network.max_fee("45 gwei")
+        45000000000
+
+.. py:method:: main.priority_fee(*args)
+
+    Gets and optionally sets the default max priority fee per gas.
+
+    * If an integer value is given, this will be the default priority fee.
+    * If set to ``"auto"``, the fee is determined automatically via :attr:`web3.eth.max_priority_fee <web3.eth.Eth.max_priority_fee>`.
+    * If set to ``None`` or ``False``, transactions will instead default to using a legacy-style ``gas_price``.
+
+    .. code-block:: python
+
+        >>> from brownie import network
+        >>> network.priority_fee()
+        None
+        >>> network.priority_fee(4000000000)
+        4000000000
+        >>> network.priority_fee("2 gwei")
+        2000000000
 
 ``brownie.network.account``
 ===========================
@@ -228,6 +263,30 @@ Accounts Methods
 
         >>> accounts.remove('0xc1826925377b4103cC92DeeCDF6F96A03142F37a')
 
+.. py:classmethod:: Accounts.connect_to_clef(uri=None, timeout=120)
+
+    Connect to clef and add unlocked accounts to the container as :func:`ClefAccount <brownie.network.account.ClefAccount>` objects.
+
+    `Clef <https://geth.ethereum.org/docs/clef/tutorial>`_ is an account signing utility packaged with Geth, which can be used to interact with hardware wallets in Brownie. Before calling this function, Clef must be running and unlocked in another command prompt.
+
+    * ``uri``: IPC path or http url to use to connect to clef. If ``None``, uses clef's default IPC path on Unix systems or ``http://localhost:8550/`` on Windows.
+    * ``timeout``: The number of seconds to wait for clef to respond to a request before raising a ``TimeoutError``.
+
+    .. code-block:: python
+
+        >>> accounts
+        []
+        >>> accounts.connect_to_clef()
+        >>> accounts
+        [<ClefAccount object '0x716E8419F2926d6AcE07442675F476ace972C580'>]
+
+.. py:classmethod:: Accounts.disconnect_from_clef()
+
+    Disconnect from Clef.
+
+    Removes all :func:`ClefAccount <brownie.network.account.ClefAccount>` objects from the container.
+
+
 Accounts Internal Methods
 *************************
 
@@ -297,17 +356,19 @@ Account Methods
         >>> accounts[0].balance() == "100 ether"
         True
 
-.. py:classmethod:: Account.deploy(contract, *args, amount=None, gas_limit=None, gas_price=None, nonce=None, required_confs=1, allow_revert=False, silent=False, publish_source=False,)
+.. py:classmethod:: Account.deploy(contract, *args, amount=None, gas_limit=None, gas_price=None, max_fee=None, priority_fee=None, nonce=None, required_confs=1, allow_revert=False, silent=False, publish_source=False,)
 
     Deploys a contract.
 
     * ``contract``: A :func:`ContractContainer <brownie.network.contract.ContractContainer>` instance of the contract to be deployed.
     * ``*args``: Contract constructor arguments.
     * ``amount``: Amount of ether to send with the transaction. The given value is converted to :func:`Wei <brownie.convert.datatypes.Wei>`.
-    * ``gas_limit``: Gas limit for the transaction. The given value is converted to :func:`Wei <brownie.convert.datatypes.Wei>`. If none is given, the price is set using :meth:`web3.eth.estimateGas <web3.eth.Eth.estimateGas>`.
-    * ``gas_buffer``: A multiplier applied to :meth:`web3.eth.estimateGas <web3.eth.Eth.estimateGas>` when setting gas limit automatically. ``gas_limit`` and ``gas_buffer`` cannot be given at the same time.
-    * ``gas_price``: Gas price for the transaction. The given value is converted to :func:`Wei <brownie.convert.datatypes.Wei>`. If none is given, the price is set using :attr:`web3.eth.gasPrice <web3.eth.Eth.gasPrice>`.
-    * ``nonce``: Nonce for the transaction. If none is given, the nonce is set using :meth:`web3.eth.getTransactionCount <web3.eth.Eth.getTransactionCount>` while also considering any pending transactions of the Account.
+    * ``gas_limit``: Gas limit for the transaction. The given value is converted to :func:`Wei <brownie.convert.datatypes.Wei>`. If none is given, the price is set using :meth:`web3.eth.estimate_gas <web3.eth.Eth.estimateGas>`.
+    * ``gas_buffer``: A multiplier applied to :meth:`web3.eth.estimate_gas <web3.eth.Eth.estimateGas>` when setting gas limit automatically. ``gas_limit`` and ``gas_buffer`` cannot be given at the same time.
+    * ``gas_price``: Gas price for legacy transaction. The given value is converted to :func:`Wei <brownie.convert.datatypes.Wei>`. If none is given, the price is set using :attr:`web3.eth.gas_price <web3.eth.Eth.gasPrice>`.
+    * ``max_fee``: Max fee per gas of dynamic fee transaction.
+    * ``priority_fee``: Max priority fee per gas of dynamic fee transaction.
+    * ``nonce``: Nonce for the transaction. If none is given, the nonce is set using :meth:`web3.eth.get_transaction_count <web3.eth.Eth.getTransactionCount>` while also considering any pending transactions of the Account.
     * ``required_confs``: The required :attr:`confirmations<TransactionReceipt.confirmations>` before the :func:`TransactionReceipt <brownie.network.transaction.TransactionReceipt>` is processed. If none is given, defaults to 1 confirmation.  If 0 is given, immediately returns a pending :func:`TransactionReceipt <brownie.network.transaction.TransactionReceipt>` instead of a :func:`Contract <brownie.network.contract.Contract>` instance, while waiting for a confirmation in a separate thread.
     * ``allow_revert``: When ``True``, forces the deployment of a contract, even if a revert reason is detected.
     * ``silent``: When ``True``, suppresses any console output for the deployment.
@@ -360,17 +421,19 @@ Account Methods
         >>> accounts[0].get_deployment_address()
         '0xd495633B90a237de510B4375c442C0469D3C161C'
 
-.. py:classmethod:: Account.transfer(self, to=None, amount=0, gas_limit=None, gas_price=None, data=None, nonce=None, required_confs=1, allow_revert=None, silent=False)
+.. py:classmethod:: Account.transfer(self, to=None, amount=0, gas_limit=None, gas_price=None, max_fee=None, priority_fee=None, data=None, nonce=None, required_confs=1, allow_revert=None, silent=False)
 
     Broadcasts a transaction from this account.
 
     * ``to``: Recipient address. Can be an :func:`Account <brownie.network.account.Account>` instance or string.
     * ``amount``: Amount of ether to send. The given value is converted to :func:`Wei <brownie.convert.datatypes.Wei>`.
-    * ``gas_limit``: Gas limit for the transaction. The given value is converted to :func:`Wei <brownie.convert.datatypes.Wei>`. If none is given, the price is set using :meth:`web3.eth.estimateGas <web3.eth.Eth.estimateGas>`.
-    * ``gas_buffer``: A multiplier applied to :meth:`web3.eth.estimateGas <web3.eth.Eth.estimateGas>` when setting gas limit automatically. ``gas_limit`` and ``gas_buffer`` cannot be given at the same time.
-    * ``gas_price``: Gas price for the transaction. The given value is converted to :func:`Wei <brownie.convert.datatypes.Wei>`. If none is given, the price is set using :attr:`web3.eth.gasPrice <web3.eth.Eth.gasPrice>`.
+    * ``gas_limit``: Gas limit for the transaction. The given value is converted to :func:`Wei <brownie.convert.datatypes.Wei>`. If none is given, the price is set using :meth:`web3.eth.estimate_gas <web3.eth.Eth.estimateGas>`.
+    * ``gas_buffer``: A multiplier applied to :meth:`web3.eth.estimate_gas <web3.eth.Eth.estimateGas>` when setting gas limit automatically. ``gas_limit`` and ``gas_buffer`` cannot be given at the same time.
+    * ``gas_price``: Gas price for legacy transaction. The given value is converted to :func:`Wei <brownie.convert.datatypes.Wei>`. If none is given, the price is set using :attr:`web3.eth.gas_price <web3.eth.Eth.gasPrice>`.
+    * ``max_fee``: Max fee per gas of dynamic fee transaction.
+    * ``priority_fee``: Max priority fee per gas of dynamic fee transaction.
     * ``data``: Transaction data hexstring.
-    * ``nonce``: Nonce for the transaction. If none is given, the nonce is set using :meth:`web3.eth.getTransactionCount <web3.eth.Eth.getTransactionCount>` while also considering any pending transactions of the Account.
+    * ``nonce``: Nonce for the transaction. If none is given, the nonce is set using :meth:`web3.eth.get_transaction_count <web3.eth.Eth.getTransactionCount>` while also considering any pending transactions of the Account.
     * ``required_confs``: The required :attr:`confirmations<TransactionReceipt.confirmations>` before the :func:`TransactionReceipt <brownie.network.transaction.TransactionReceipt>` is processed. If none is given, defaults to 1 confirmation.  If 0 is given, immediately returns a pending :func:`TransactionReceipt <brownie.network.transaction.TransactionReceipt>`, while waiting for a confirmation in a separate thread.
     * ``allow_revert``: Boolean indicating whether the transaction should be broadacsted when it is expected to revert. If not set, the default behaviour is to allow reverting transactions in development and disallow them in a live environment.
     * ``silent``: Toggles console verbosity. If ``True`` is given, suppresses all console output for this transaction.
@@ -454,6 +517,21 @@ LocalAccount Methods
         >>> accounts[-1].save('~/my_account.json')
         Enter the password to encrypt this account with:
         /home/computer/my_account.json
+
+ClefAccount
+------------
+
+.. py:class:: brownie.network.account.ClefAccount
+
+    Functionally identical to :func:`Account <brownie.network.account.Account>`. A ``ClefAccount`` object is used for accounts that have been unlocked via `clef <https://geth.ethereum.org/docs/clef/tutorial>`_, and where signing of transactions is handled externally from brownie. This is useful for hardware wallets.
+
+    .. code-block:: python
+
+        >>> accounts
+        []
+        >>> accounts.connect_to_clef()
+        >>> accounts
+        [<ClefAccount object '0x716E8419F2926d6AcE07442675F476ace972C580'>]
 
 PublicKeyAccount
 ----------------
@@ -987,12 +1065,13 @@ Contract Internal Attributes
 ContractCall
 ------------
 
-.. py:class:: brownie.network.contract.ContractCall(*args, block_identifier=None)
+.. py:class:: brownie.network.contract.ContractCall(*args, block_identifier=None, override=None)
 
     Calls a non state-changing contract method without broadcasting a transaction, and returns the result. ``args`` must match the required inputs for the method.
 
     * ``args``: Input arguments for the call. The expected inputs are shown in the method's ``__repr__`` value.
     * ``block_identifier``: A block number or hash that the call is executed at. If ``None``, the latest block is used. Raises `ValueError` if this value is too far in the past and you are not using an archival node.
+    *  ``override``: A mapping from addresses to balance, nonce, code, state, stateDiff overrides for the context of the call.
 
     Inputs and return values are formatted via methods in the :ref:`convert<api-convert>` module. Multiple values are returned inside a :func:`ReturnValue <brownie.convert.datatypes.ReturnValue>`.
 
@@ -1002,6 +1081,8 @@ ContractCall
         <ContractCall object 'allowance(address,address)'>
         >>> Token[0].allowance(accounts[0], accounts[2])
         0
+
+    For override see :ref:`ContractTx.call<override>` docs.
 
 ContractCall Attributes
 ***********************
@@ -1119,12 +1200,14 @@ ContractTx Attributes
 ContractTx Methods
 ******************
 
-.. py:classmethod:: ContractTx.call(*args, block_identifier=None)
+
+.. py:classmethod:: ContractTx.call(*args, block_identifier=None, override=None)
 
     Calls the contract method without broadcasting a transaction, and returns the result.
 
     * ``args``: Input arguments for the call. The expected inputs are shown in the method's ``__repr__`` value.
     * ``block_identifier``: A block number or hash that the call is executed at. If ``None``, the latest block is used. Raises `ValueError` if this value is too far in the past and you are not using an archival node.
+    * ``override``: A mapping from addresses to balance, nonce, code, state, stateDiff overrides for the context of the call.
 
     Inputs and return values are formatted via methods in the :ref:`convert<api-convert>` module. Multiple values are returned inside a :func:`ReturnValue <brownie.convert.datatypes.ReturnValue>`.
 
@@ -1132,6 +1215,30 @@ ContractTx Methods
 
         >>> Token[0].transfer.call(accounts[2], 10000, {'from': accounts[0]})
         True
+
+    .. _override:
+
+    The override argument allows replacing balance, nonce and code associated with an address, as well as overwriting individual storage slot value.
+    See `Geth docs <https://geth.ethereum.org/docs/rpc/ns-eth>`_ for more details.
+
+    For example, you can query an exchange rate of an imbalanced Curve pool if it had a different A parameter:
+
+    .. code-block:: python
+
+        >>> for A in [300, 1000, 2000]:
+                override = {
+                    "0x5a6A4D54456819380173272A5E8E9B9904BdF41B": {
+                        "stateDiff": {
+                            "0x0000000000000000000000000000000000000000000000000000000000000009": hex(A * 100),
+                        }
+                    }
+                }
+                result = pool.get_dy_underlying(0, 1, 1e18, override=override)
+                print(A, result.to("ether"))
+        
+        300 0.884657790783695579
+        1000 0.961374099348799411
+        2000 0.979998831913646748
 
 .. py:classmethod:: ContractTx.decode_input(hexstr)
 
@@ -1487,7 +1594,7 @@ Internal Methods
 ``brownie.network.gas``
 =======================
 
-The ``gas`` module contains gas strategy classes, as well as abstract base classes for buiding your own gas strategies.
+The ``gas`` module contains gas strategy classes, as well as abstract base classes for building your own gas strategies.
 
 Gas Strategies
 --------------
@@ -1622,6 +1729,110 @@ To implement a scaling strategy, subclass one of the above ABCs and implement th
     Generator function that yields a new gas price each time it is called.
 
     The produced generator is called every ``duration`` seconds while a transaction is still pending. Each call must yield a new gas price as an integer. If the newly yielded value is at least 10% higher than the current gas price, the transaction is rebroadcasted with the new gas price.
+
+``brownie.network.multicall``
+=============================
+
+The ``multicall`` module contains the :func:`Multicall <brownie.network.multicall.Multicall>` context manager, which allows for the batching of multiple constant contract function calls via ``Multicall2``.
+
+.. note::
+
+    The :func:`Multicall <brownie.network.multicall.Multicall>` context manager is not meant to be instantiated, and instead should be used via ``brownie.multicall``
+
+Multicall
+---------
+
+.. py:class:: brownie.network.multicall.Multicall(address=None, block_identifier=None)
+
+    Instances of ``Multicall`` allow for the batching of constant contract function calls through a modified version of the standart Brownie call API.
+
+    The only syntatic difference between a multicall and a standard brownie contract function call is the final argument for a multicall, is a dictionary with the ``from`` key being the instance of ``Multicall`` being used.
+
+    Features:
+
+        1. Lazy fetching of results
+        2. Auto-deployment on development networks (on first use).
+        3. Uses ``multicall2`` key in network-config as pre-defined multicall contract address
+        4. Can specify/modify block number to make calls at particular block heights
+        5. Calls which fail return ``None`` instad of causing all calls to fail
+
+    .. code-block:: python
+
+        >>> import brownie
+        >>> from brownie import Contract
+        >>> addr_provider = Contract("0x0000000022D53366457F9d5E68Ec105046FC4383")
+        >>> registry = Contract(addr_provider.get_registry())
+        >>> with brownie.multicall:
+        ...     pool_count = registry.pool_count.call()  # standard call, no batching
+        ...     pools = [registry.pool_list(i) for i in range(pool_count)]  # batched
+        ...     gauges = [registry.get_gauges(pool) for pool in pools]  # batched
+        ... print(*zip(pools, gauges), sep="\n")
+
+Multicall Attributes
+********************
+
+.. py:attribute:: Multicall.address
+
+    The deployed ``Multicall2`` contract address used for batching calls.
+
+    .. code-block:: python
+
+        >>> brownie.multicall.address
+        0x5BA1e12693Dc8F9c48aAD8770482f4739bEeD696
+        >>> brownie.multicall(address="0xc8E51042792d7405184DfCa245F2d27B94D013b6").address
+        0xc8E51042792d7405184DfCa245F2d27B94D013b6
+
+.. py:attribute:: Multicall.block_number
+
+    The block height which call results are aggregated from.
+
+    .. note::
+
+        ``Multicall`` relies on an instance of ``Multicall2`` being available for aggregating results. If you set the block_height before the ``Multicall2`` instance you are using was deployed a ``ContractNotFound`` error will be raised.
+
+    .. code-block:: python
+
+        >>> with brownie.multicall(block_identifier=12733683):
+        ...     brownie.multicall.block_number
+        12733683
+
+Multicall Methods
+*****************
+
+.. py:classmethod:: Multicall.deploy
+
+    Deploys an instance of ``Multicall2``, especially useful when creating fixutes for testing.
+
+    .. code-block:: python
+
+        >>> multicall2 = brownie.multicall.deploy({"from": alice})
+        <Multicall2 Contract object '0x5419710735c2D6c3e4db8F30EF2d361F70a4b380'>
+
+.. py:classmethod:: Multicall.flush
+
+    Flushes the current queue of pending calls, especially useful for preventing ``OOG`` errors from occuring when querying large amounts of data.
+
+    >>> results = []
+    >>> long_list_of_addresses = [...]
+    >>> token = Contract(...)
+    >>> with brownie.multicall:
+    ...     for i, addr in enumerate(long_list_of_addresses):
+    ...         if i % 1_000:
+    ...             brownie.multicall.flush()
+    ...         results.append(token.balanceOf(addr))
+
+Multicall Internal Attributes
+*****************************
+
+.. py:attribute:: Multicall._contract
+
+    The contract instance of ``Multicall2`` used to query data
+
+.. py:attribute:: Multicall._pending_calls
+
+    List of proxy objects representing calls to be made. While pending, these calls contain the data necessary to make an aggregate call with multicall and also decode the result.
+
+
 
 ``brownie.network.state``
 =========================
@@ -1768,16 +1979,16 @@ Chain
 
     .. code-block:: python
 
-        >>> web3.eth.blockNumber
+        >>> web3.eth.block_number
         10451202
 
         >>> len(chain)
         10451203  # always +1 to the current block number, because the first block is zero
 
-        >>> chain[0] == web3.eth.getBlock(0)
+        >>> chain[0] == web3.eth.get_block(0)
         True
 
-        >>> chain[-1] == web3.eth.getBlock('latest')
+        >>> chain[-1] == web3.eth.get_block('latest')
         True
 
 Chain Attributes
@@ -1866,7 +2077,7 @@ Chain Methods
 
     .. code-block:: python
 
-        >>> web3.eth.blockNumber
+        >>> web3.eth.block_number
         0
         >>> chain.mine()
         1
@@ -1925,7 +2136,7 @@ Chain Methods
 
     .. code-block:: python
 
-        >>> web3.eth.blockNumber
+        >>> web3.eth.block_number
         3
         >>> chain.undo()
         2
@@ -1940,7 +2151,7 @@ Chain Methods
 
     .. code-block:: python
 
-        >>> web3.eth.blockNumber
+        >>> web3.eth.block_number
         2
         >>> chain.redo()
         Transaction sent: 0x8c166b66b356ad7f5c58337973b89950f03105cdae896ac66f16cdd4fc395d05
@@ -2215,7 +2426,7 @@ TransactionReceipt Attributes
 
 .. py:attribute:: TransactionReceipt.gas_price
 
-    The gas price of the transaction, in wei as an ``int``.
+    The effective gas price of the transaction, in wei as an ``int``.
 
     .. code-block:: python
 
@@ -2510,6 +2721,8 @@ TransactionReceipt Methods
 
     * ``increment``: Multiplier applied to the gas price of the current transaction in order to determine a new gas price
     * ``gas_price``: Absolute gas price to use in the replacement transaction
+
+    For EIP-1559 transactions, the modification is applied to ``max_fee``. The ``priority_fee`` is always multiplied by 1.1 (the minimum increase required to be accepted by a node).
 
     Returns a :func:`TransactionReceipt <brownie.network.transaction.TransactionReceipt>` object.
 

@@ -5,7 +5,6 @@ from hashlib import sha1
 from pathlib import Path
 
 import hypothesis
-from py.path import local
 
 import brownie
 from brownie._config import CONFIG
@@ -27,7 +26,7 @@ class PytestBrownieBase:
 
         self.config = config
         # required when brownie project is in a subfolder of another project
-        config.rootdir = local(project._path)
+        config._rootpath = Path(project._path)
 
         self.project = project
         self.project_path = project._path
@@ -100,6 +99,9 @@ class PytestBrownieBase:
         )
         config.addinivalue_line(
             "markers", "skip_coverage: skips a test when coverage evaluation is active"
+        )
+        config.addinivalue_line(
+            "markers", "no_call_coverage: do not evaluate coverage for calls made during a test"
         )
 
         for key in ("coverage", "always_transact"):
@@ -185,6 +187,7 @@ class PytestBrownieBase:
                 path, test_id = self._test_id(report.nodeid)
                 idx = self.node_map[path].index(test_id)
                 report.outcome = convert_outcome(self.results[path][idx])
+                report.longrepr = (path, None, "Skipped")  # File path, line no., reason
                 return "skipped", "s", "SKIPPED"
             return "", "", ""
         if hasattr(report, "wasxfail"):
