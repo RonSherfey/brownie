@@ -20,10 +20,6 @@ async-timeout==4.0.1
     # via
     #   -r requirements.txt
     #   aiohttp
-asynctest==0.13.0
-    # via
-    #   -r requirements.txt
-    #   aiohttp
 attrs==21.2.0
     # via
     #   -r requirements.txt
@@ -41,10 +37,6 @@ bitarray==1.2.2
     #   eth-account
 black==21.11b1
     # via -r requirements.txt
-cached-property==1.5.2
-    # via
-    #   -r requirements.txt
-    #   vyper
 certifi==2021.10.8
     # via
     #   -r requirements.txt
@@ -147,15 +139,6 @@ idna==3.3
     #   -r requirements.txt
     #   requests
     #   yarl
-importlib-metadata==4.8.2
-    # via
-    #   -r requirements.txt
-    #   click
-    #   eip712
-    #   jsonschema
-    #   pluggy
-    #   pytest
-    #   vyper
 inflection==0.5.0
     # via
     #   -r requirements.txt
@@ -335,19 +318,11 @@ toolz==0.11.2
     #   cytoolz
 tqdm==4.62.3
     # via -r requirements.txt
-typed-ast==1.5.1
-    # via
-    #   -r requirements.txt
-    #   black
 typing-extensions==3.10.0.2
     # via
     #   -r requirements.txt
-    #   aiohttp
     #   async-timeout
     #   black
-    #   importlib-metadata
-    #   web3
-    #   yarl
 urllib3==1.26.7
     # via
     #   -r requirements.txt
@@ -358,7 +333,7 @@ varint==1.0.2
     #   multiaddr
 vvm==0.1.0
     # via -r requirements.txt
-vyper==0.3.1
+vyper==0.3.2
     # via -r requirements.txt
 wcwidth==0.2.5
     # via
@@ -370,16 +345,16 @@ websockets==9.1
     # via
     #   -r requirements.txt
     #   web3
+wheel==0.37.1
+    # via
+    #   -r requirements.txt
+    #   vyper
 wrapt==1.13.3
     # via -r requirements.txt
 yarl==1.7.2
     # via
     #   -r requirements.txt
     #   aiohttp
-zipp==3.6.0
-    # via
-    #   -r requirements.txt
-    #   importlib-metadata
 
 # The following packages are considered to be unsafe in a requirements file:
 # setuptools
